@@ -199,6 +199,13 @@ def run_registration(
     #   browser_use  = Browser Use Cloud stealth Chromium + Playwright
     #   skyvern      = Skyvern Browser Sessions + Playwright
     driver_mode = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
+    if driver_mode == "gptaccount":
+        from core.gptaccount_registration import run_gptaccount_registration
+        return run_gptaccount_registration(
+            email=email, name=name, birthday=birthday or generate_random_birthday(),
+            proxy=proxy, otp_code=otp_code, batch_dir=batch_dir,
+            on_email_acquired=on_email_acquired,
+        )
     if driver_mode in ("roxy", "roxybrowser", "fingerprint", "browser"):
         from core.roxy_registration import run_roxy_registration
         return run_roxy_registration(
@@ -245,7 +252,7 @@ def run_registration(
         )
     if driver_mode not in ("protocol", "api", "http"):
         raise RuntimeError(
-            f"不支持的 REGISTRATION_DRIVER={driver_mode!r}，可选 protocol / roxy / cloak / browser_use / skyvern"
+            f"不支持的 REGISTRATION_DRIVER={driver_mode!r}，可选 protocol / roxy / cloak / browser_use / skyvern / gptaccount"
         )
 
     # 纯协议驱动没有“邮箱输入框”可等待，因此在创建 BrowserSession 前领取。

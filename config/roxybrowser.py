@@ -16,6 +16,7 @@ from config.env_loader import env_str, apply_env_overrides
 #   "cloak"        = 调用 CloakBrowser + Playwright/Selenium 适配层注册
 #   "browser_use"  = Browser Use Cloud stealth Chromium + Playwright
 #   "skyvern"      = Skyvern Browser Sessions + Playwright
+#   "gptaccount"   = GptAccount 临时 Chrome + 本地 CDP 桥接
 REGISTRATION_DRIVER: str = "roxy"
 
 # RoxyBrowser 本地 API

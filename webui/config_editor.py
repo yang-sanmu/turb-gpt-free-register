@@ -52,7 +52,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "注册方式",
-        "label": "注册驱动", "help": "默认推荐 roxy；protocol=纯协议，容易封号不建议；roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud+Playwright；skyvern=Skyvern Browser Sessions+Playwright",
+        "label": "注册驱动", "help": "roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud；skyvern=Skyvern；gptaccount=GptAccount 临时 Chrome；protocol=纯协议",
     },
     {
         "key": "AUTO_PLAN_CHECK_AFTER_REGISTER", "file": "register.py", "type": "bool", "group": "注册方式",
@@ -62,6 +62,20 @@ EDITABLE_FIELDS = [
         "key": "PROTOCOL_REUSE_FINGERPRINT_BY_EMAIL", "file": "register.py", "type": "bool", "group": "注册方式",
         "label": "同邮箱保持协议指纹", "help": "仅影响纯协议注册；开启后同一邮箱重复任务复用稳定设备指纹，关闭后每次任务创建全新指纹",
     },
+
+    # ---- GptAccount ----
+    {"key": "GPTACCOUNT_PROJECT_DIR", "file": "gptaccount.py", "type": "str", "group": "GptAccount",
+     "label": "GptAccount 项目目录", "help": "包含 scripts/registration-browser.mjs 的项目；留空使用当前项目旁的 GptAccount 目录"},
+    {"key": "GPTACCOUNT_NODE", "file": "gptaccount.py", "type": "str", "group": "GptAccount",
+     "label": "Node 程序", "help": "默认 node；可填写 Node 24 可执行文件绝对路径"},
+    {"key": "GPTACCOUNT_HEADLESS", "file": "gptaccount.py", "type": "bool", "group": "GptAccount",
+     "label": "无头运行", "help": "关闭时显示 Chrome 窗口；两种方式均在任务结束后清理临时目录"},
+    {"key": "GPTACCOUNT_LOCALE", "file": "gptaccount.py", "type": "str", "group": "GptAccount",
+     "label": "浏览器语言", "help": "例如 en-US；本阶段手动指定"},
+    {"key": "GPTACCOUNT_TIMEZONE", "file": "gptaccount.py", "type": "str", "group": "GptAccount",
+     "label": "浏览器时区", "help": "例如 Asia/Kolkata；留空跟随本机时区"},
+    {"key": "GPTACCOUNT_START_TIMEOUT", "file": "gptaccount.py", "type": "int", "group": "GptAccount",
+     "label": "浏览器启动等待秒数", "help": "默认 75 秒"},
 
     # ---- CloakBrowser ----
     {

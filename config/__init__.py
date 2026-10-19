@@ -210,6 +210,7 @@ _RELOADABLE_SUBMODULES = (
     "config.twofa",
     "config.roxybrowser",
     "config.cloakbrowser",
+    "config.gptaccount",
     "config.browser_use",
     "config.skyvern",
     "config.flow_trigger",
