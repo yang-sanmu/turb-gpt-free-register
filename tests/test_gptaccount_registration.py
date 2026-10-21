@@ -41,6 +41,10 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.save = self.stack.enter_context(patch.object(flow, "save_account_data", return_value=42))
         self.stack.enter_context(patch.object(flow, "PlaywrightTrafficTracker", side_effect=RuntimeError("test-no-tracker")))
         self.saver = self.stack.enter_context(patch.object(flow, "BrowserDataSaver"))
+        self.network = self.stack.enter_context(patch(
+            "core.gptaccount_registration.start_gptaccount_network",
+            return_value=(None, self.saver.return_value),
+        ))
         for name in ["human_delay", "post_register_dwell", "_check_manual_stop", "_maybe_accept", "_clear_otp_inputs", "_type_otp", "_click_continue"]:
             self.stack.enter_context(patch.object(flow, name))
         self.stack.enter_context(patch.object(flow, "_submit_email_and_wait_next", return_value="otp"))
@@ -68,6 +72,7 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.assertIn("gptaccount", payload["extra"])
         self.assertEqual(payload["proxy_used"], "http://proxy.example:8080")
         self.driver.quit.assert_called_once()
+        self.network.assert_called_once_with(self.driver, label="GptAccount")
         codex.assert_not_called()
 
     def test_snapshot_failure_keeps_registered_account_and_reports_partial_failure(self):
@@ -77,7 +82,37 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.assertEqual(result["account_id"], 42)
         self.assertIn("Cookies", result["error"])
         self.save.assert_called_once()
+        self.driver.get.assert_any_call("about:blank")
         self.driver.quit.assert_called_once()
+
+    def test_cdp_statistics_start_failure_does_not_abort_registration(self):
+        from core.gptaccount_network import start_gptaccount_network
+
+        self.network.side_effect = start_gptaccount_network
+        self.driver.context.new_cdp_session.side_effect = RuntimeError("CDP unavailable")
+        with patch("config.browser.BROWSER_DATA_SAVER_MODE", True):
+            result = self.run_flow()
+        self.assertTrue(result["success"], result)
+        self.assertIsNone(result["network_traffic"])
+        self.save.assert_called_once()
+        self.driver.execute_cdp_cmd.assert_called()
+        self.driver.context.route.assert_not_called()
+        self.driver.quit.assert_called_once()
+
+    def test_cache_traffic_is_saved_on_success_and_returned_on_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                tracker = Mock()
+                traffic = {"total_bytes": 123, "local_asset_cache": {"hits": 4}}
+                tracker.stop.return_value = traffic
+                self.network.return_value = (tracker, self.saver.return_value)
+                with patch.object(flow, "_submit_email_and_wait_next", side_effect=RuntimeError("fixture failure") if fail else None):
+                    result = self.run_flow()
+                self.assertEqual(result["network_traffic"], traffic)
+                self.assertEqual(result["success"], not fail)
+                if not fail:
+                    self.assertEqual(self.save.call_args.kwargs["extra"]["network_traffic"], traffic)
+                self.assertTrue(tracker.stop.called)
 
     def test_cancellation_at_checkpoint_closes_browser(self):
         from core.registration_service import StopRequested
@@ -141,6 +176,8 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.assertTrue(result["success"], result)
         factory.assert_called_once()
         self.factory.assert_not_called()
+        self.network.assert_not_called()
+        self.saver.return_value.install_playwright.assert_called_once_with(self.driver.context)
         self.driver.context.storage_state.assert_not_called()
         self.driver.quit.assert_not_called()
         self.assertIn("cloakbrowser", self.save.call_args.kwargs["extra"])
@@ -190,16 +227,14 @@ class GptAccountDriverTests(unittest.TestCase):
             self.assertEqual(row["access_token"], "fixture-token")
             self.assertEqual(twofa.call_args.kwargs["proxy"], "http://proxy.example:80")
 
-    def test_capture_closes_old_pages_after_snapshot(self):
-        old, fresh = Mock(), Mock()
-        context = Mock(pages=[old])
-        context.storage_state.return_value = {"cookies": [], "origins": []}
-        context.new_page.return_value = fresh
-        driver = SimpleNamespace(context=context, page=old)
+    def test_capture_preserves_state_before_stopping_page_downloads(self):
+        driver = Mock()
+        state = {"cookies": [{"name": "session", "value": "fixture"}], "origins": []}
+        driver.context.storage_state.return_value = state
+        driver.get.side_effect = lambda url: driver.context.storage_state.assert_called_once()
         snapshot = capture_browser_state(driver)
-        self.assertEqual(snapshot["storage_state"], {"cookies": [], "origins": []})
-        old.close.assert_called_once()
-        self.assertIs(driver.page, fresh)
+        self.assertEqual(snapshot["storage_state"], state)
+        driver.get.assert_called_once_with("about:blank")
 
 
 if __name__ == "__main__":

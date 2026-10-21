@@ -4,8 +4,12 @@ PowerShell: $env:GPTACCOUNT_BROWSER_TEST='1'
 python -m unittest discover -s tests -p test_gptaccount_browser.py -v
 """
 import base64
+import gzip
 import os
+import random
+import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +18,7 @@ from unittest.mock import patch
 from config import gptaccount as cfg
 from core.gptaccount_driver import GptAccountBridge, build_gptaccount_driver
 from core.gptaccount_registration import capture_browser_state
+from core.gptaccount_network import start_gptaccount_network
 
 
 class ProxyFixture(BaseHTTPRequestHandler):
@@ -68,6 +73,16 @@ class RealGptAccountBrowserTests(unittest.TestCase):
                     found["button"].click()
                     self.assertEqual(driver.page.title(), "fixture@example.com")
                     self.assertEqual(driver.page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone"), "Asia/Tokyo")
+                    # The upstream birthday fallback replaces selected text without
+                    # Backspace; send_keys must preserve that selection.
+                    driver.page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
+                        '<input role="spinbutton" data-type="year" value="2000">' +
+                        '<input role="spinbutton" data-type="month" value="01">' +
+                        '<input role="spinbutton" data-type="day" value="01">')""")
+                    from core.roxy_registration import _fill_birthday_or_age
+                    self.assertEqual(_fill_birthday_or_age(driver, "1995-06-17", 31), "spinbutton")
+                    self.assertEqual(driver.page.locator('[role="spinbutton"]').evaluate_all(
+                        "elements => elements.map(el => el.value)"), ["1995", "06", "17"])
                     driver.page.evaluate("localStorage.setItem('fixture_key', 'fixture_value')")
                     state = capture_browser_state(driver)["storage_state"]
                     self.assertTrue(any(c["name"] == "fixture_cookie" and c["httpOnly"] for c in state["cookies"]))
@@ -112,6 +127,109 @@ class RealGptAccountBrowserTests(unittest.TestCase):
             with self.assertRaises(StopRequested):
                 build_gptaccount_driver("")
         self.assertEqual(set(Path(os.environ["TEMP"]).glob("gptaccount-registration-*")), before)
+
+
+class CacheProxyFixture(ProxyFixture):
+    # A compressed script proves that cached body bytes are not wire bytes.
+    script = b"window.cacheFixture = true;/*" + bytes(random.Random(7).choices(
+        b"abcdefghijklmnopqrstuvwxyz0123456789", k=192000)) + b"*/"
+    encoded_script = gzip.compress(script)
+
+    def do_GET(self):
+        self.server.requests.append(self.path)
+        if self.path.startswith("http://registration-fixture.invalid/"):
+            version = "v2" if "v2" in self.path else "v1"
+            body = (f'<script src="http://fixture.oaistatic.com/assets/app.{version}.js"></script>'
+                    '<link rel="stylesheet" href="http://fixture.oaistatic.com/assets/style.css">'
+                    '<script>fetch("http://fixture.oaistatic.com/api/session")'
+                    '.then(r => r.json()).then(() => window.apiFixture = true)</script>').encode()
+            content_type = "text/html"
+        elif self.path.startswith("http://fixture.oaistatic.com/assets/app."):
+            body, content_type = self.encoded_script, "application/javascript"
+        elif self.path == "http://fixture.oaistatic.com/api/session":
+            body, content_type = b'{"ok":true}', "application/json"
+        elif self.path.endswith("/style.css"):
+            body, content_type = b"body{color:black}", "text/css"
+        else:
+            self.send_error(403)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "public, max-age=3600" if "/assets/" in self.path else "no-store")
+        if content_type == "application/javascript":
+            self.send_header("Content-Encoding", "gzip")
+        if content_type == "text/html":
+            self.send_header("Set-Cookie", "fixture_session=private; Path=/; HttpOnly")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@unittest.skipUnless(os.environ.get("GPTACCOUNT_BROWSER_TEST") == "1", "opt-in real Chrome test")
+class GptAccountCacheBrowserTests(unittest.TestCase):
+    def test_fresh_profiles_share_static_cache_but_not_sessions_or_api(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CacheProxyFixture)
+        server.requests = []
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        proxy = f"http://127.0.0.1:{server.server_port}"
+        results = {}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(cfg, "GPTACCOUNT_HEADLESS", True), \
+                patch("config.proxy.PROXY_POOL_UPSTREAM_PROXY", ""), \
+                patch("config.browser.BROWSER_JS_COVERAGE_LOG", False), \
+                patch("config.browser.BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES", ["image", "stylesheet"]), \
+                patch("config.roxybrowser.ROXY_LOCAL_ASSET_CACHE_DIR", directory), \
+                patch("config.roxybrowser.ROXY_LOCAL_ASSET_CACHE_MODE", "auto"):
+            for name, enabled, version in [("cold", True, "v1"), ("warm", True, "v1"),
+                                           ("changed", True, "v2"), ("disabled", False, "v1")]:
+                with self.subTest(name=name), patch("config.browser.BROWSER_DATA_SAVER_MODE", enabled):
+                    driver = tracker = saver = None
+                    before = len(server.requests)
+                    try:
+                        driver, _ = build_gptaccount_driver(proxy)
+                        runtime = Path(driver._bridge.runtime_dir)
+                        self.assertFalse(driver.context.cookies("http://registration-fixture.invalid/"))
+                        tracker, saver = start_gptaccount_network(driver)
+                        with patch.object(driver.context, "route", side_effect=AssertionError("routing must stay off")):
+                            driver.get(f"http://registration-fixture.invalid/{version}")
+                            driver.page.wait_for_function("window.cacheFixture && window.apiFixture", timeout=10000)
+                        if enabled:
+                            deadline = time.monotonic() + 5
+                            while tracker.asset_cache.recorded + tracker.asset_cache.cache_hits < 1 and time.monotonic() < deadline:
+                                driver.page.wait_for_timeout(20)
+                        snapshot = capture_browser_state(driver)
+                        self.assertTrue(snapshot["storage_state"]["cookies"])
+                        traffic = tracker.stop()
+                        self.assertEqual(tracker.stop(), traffic)
+                        transport = driver.proxy_transport_snapshot()
+                        paths = server.requests[before:]
+                        self.assertIn("http://fixture.oaistatic.com/api/session", paths)
+                        self.assertEqual(any(path.endswith("style.css") for path in paths), not enabled)
+                        self.assertEqual(any(path.endswith(f"app.{version}.js") for path in paths), name != "warm")
+                        results[name] = transport["total_bytes"]
+                        if name == "warm":
+                            cache = traffic["local_asset_cache"]
+                            self.assertGreaterEqual(cache["hits"], 1)
+                            self.assertEqual(cache["bytes_saved"], len(CacheProxyFixture.script))
+                            self.assertLess(traffic["download_bytes"], len(CacheProxyFixture.encoded_script) / 4)
+                            self.assertLess(transport["total_bytes"], len(CacheProxyFixture.encoded_script) / 4)
+                        elif enabled:
+                            self.assertGreaterEqual(traffic["local_asset_cache"]["recorded"], 1)
+                            self.assertGreaterEqual(transport["download_bytes"], len(CacheProxyFixture.encoded_script))
+                        else:
+                            self.assertNotIn("local_asset_cache", traffic)
+                    finally:
+                        if tracker is not None:
+                            tracker.stop()
+                        if saver is not None:
+                            saver.stop()
+                        if driver is not None:
+                            driver.quit()
+                    self.assertFalse(runtime.exists())
+        print("Cache fixture proxy bytes:", results)
 
 
 if __name__ == "__main__":

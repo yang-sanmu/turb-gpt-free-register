@@ -43,13 +43,14 @@ def run_cloak_registration(
     browser_factory=None,
     provider: str = "cloakbrowser",
     capture_state=None,
+    network_factory=None,
 ) -> dict:
     """CloakBrowser 自动化注册入口。"""
     driver = None
     opened = None
     create_acknowledged = False
     openai_password: str | None = None
-    traffic_tracker: PlaywrightTrafficTracker | None = None
+    traffic_tracker = None
     data_saver: BrowserDataSaver | None = None
     network_traffic: dict | None = None
     label = "GptAccount" if provider == "gptaccount" else "Cloak"
@@ -59,15 +60,18 @@ def run_cloak_registration(
     result = None
     try:
         driver, opened = (browser_factory or build_cloak_driver)(proxy=proxy)
-        try:
-            traffic_tracker = PlaywrightTrafficTracker(driver.context, label=label)
-        except Exception as exc:
-            # 统计失败不应影响注册主流程。
-            log.warning("[Cloak注册] 初始化浏览器流量统计失败，继续注册：%s: %s", type(exc).__name__, str(exc)[:180])
-        data_saver = BrowserDataSaver(label=label)
-        if traffic_tracker is not None:
-            traffic_tracker.attach_data_saver(data_saver)
-        data_saver.install_playwright(driver.context)
+        if network_factory is not None:
+            traffic_tracker, data_saver = network_factory(driver, label=label)
+        else:
+            try:
+                traffic_tracker = PlaywrightTrafficTracker(driver.context, label=label)
+            except Exception as exc:
+                # 统计失败不应影响注册主流程。
+                log.warning("[Cloak注册] 初始化浏览器流量统计失败，继续注册：%s: %s", type(exc).__name__, str(exc)[:180])
+            data_saver = BrowserDataSaver(label=label)
+            if traffic_tracker is not None:
+                traffic_tracker.attach_data_saver(data_saver)
+            data_saver.install_playwright(driver.context)
         log.info("[Cloak注册] 开始：%s，profile=%s", email, opened.profile_id)
 
         otp_after_ts = time.time()

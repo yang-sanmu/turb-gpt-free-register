@@ -150,8 +150,7 @@ class GptAccountElement(CloakElement):
         elif "" in text:  # Keys.BACKSPACE; keep any selection from Ctrl+A
             keyboard.press("Backspace")
         else:
-            self._eval("el => { el.focus(); const n = (el.value || '').length;"
-                       " try { el.setSelectionRange(n, n); } catch (e) {} }")
+            self._eval("el => el.focus()")
             keyboard.type(text)
 
 
@@ -230,6 +229,7 @@ def build_gptaccount_driver(proxy=None):
         page = context.pages[0] if context.pages else context.new_page()
         driver = GptAccountDriver(bridge=bridge, playwright=playwright, browser=browser,
                                   context=context, page=page, proxy_relay=relay)
+        driver.debugger_address = endpoint
         driver.set_page_load_timeout(90)
         return driver, CloakOpenResult(profile_id="gptaccount-temporary", raw={
             "driver": "gptaccount", "proxy_pool_target": target,

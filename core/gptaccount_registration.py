@@ -3,11 +3,19 @@ from datetime import datetime, timezone
 
 from core.cloakbrowser_registration import run_cloak_registration
 from core.gptaccount_driver import build_gptaccount_driver
+from core.gptaccount_network import start_gptaccount_network
 
 
 def capture_browser_state(driver):
-    state = driver.context.storage_state()
-    _close_pages_after_capture(driver)
+    try:
+        state = driver.context.storage_state()
+    finally:
+        # Stop background downloads even if the snapshot fails. Keep the CDP
+        # target alive until accounting finishes and preserve the snapshot error.
+        try:
+            driver.get("about:blank")
+        except Exception:
+            pass
     return {
         "schema_version": 1,
         "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -16,22 +24,8 @@ def capture_browser_state(driver):
     }
 
 
-def _close_pages_after_capture(driver):
-    """ChatGPT keeps long-lived requests open; the upstream traffic tracker then
-    blocks forever in Request.sizes() on stop. Nothing uses the page after the
-    snapshot on this path, so close it and let those requests fail."""
-    try:
-        context = driver.context
-        old_pages = list(context.pages)
-        driver.page = context.new_page()
-        for page in old_pages:
-            page.close()
-    except Exception:
-        pass
-
-
 def run_gptaccount_registration(**kwargs):
     return run_cloak_registration(
         **kwargs, browser_factory=build_gptaccount_driver, provider="gptaccount",
-        capture_state=capture_browser_state,
+        capture_state=capture_browser_state, network_factory=start_gptaccount_network,
     )

@@ -98,3 +98,35 @@ node --test test/registrationBridge.test.js test/browserArgs.test.js test/browse
 ## 后续合并上游
 
 GptAccount 仅新增桥接脚本和协议测试，没有修改其原有业务文件；对应桥接提交为 `d03d06b`。当前项目主要新增驱动、配置和测试，只在注册主入口、共用流程及 WebUI 插入适配入口。更新上游时重点检查 `run_cloak_registration` 的页面步骤及 GptAccount 启动器接口；无需维护注册流程的第二份副本。两个仓库分别保存第一阶段提交，后续修改可独立比较和回退。
+
+省流接入在 `cloakbrowser_registration.py` 中增加可选的 `network_factory`，默认仍执行原有 CloakBrowser 网络初始化。GptAccount 的 CDP/缓存实现放在独立文件中。这仍是对上游文件的局部修改；若上游也修改函数参数或网络初始化段，合并时可能需要处理冲突，不能保证零冲突。
+
+## GptAccount 省流（2026-10-21）
+
+开启现有 `BROWSER_DATA_SAVER_MODE` 后，GptAccount 通过 CDP 复用 Roxy 的 URL 拦截、静态资源缓存与流量统计。共用注册流程仅增加 `network_factory` 接入参数，实现集中在 `core/gptaccount_network.py`，GptAccount 项目无需额外修改。
+
+- 沿用 `BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES`、`BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS`；使用 Roxy 的 URL 规则，具有相同的后缀匹配限制。
+- 沿用 `ROXY_LOCAL_ASSET_CACHE_DIR`（默认 `./cache/roxy-assets`）、`ROXY_LOCAL_ASSET_CACHE_MODE`（默认 `auto`）、有效期和单文件大小配置。首次下载记录静态资源，之后新建的临时 Profile 可复用；认证/API/验证码请求沿用现有缓存排除规则，Cookies 保持独立。
+- `recorded` 只统计新增缓存文件；已有有效缓存时，即使使用 `record` 模式重新下载，也不会重复写入或增加此计数。
+- GptAccount 不安装 Playwright `context.route()`。取得凭证快照后进入 `about:blank`，停止页面后台下载，并保留 CDP target 直到统计结束。
+- `network_traffic.local_asset_cache` 保存命中、新增和错误信息。`bytes_saved` 是缓存响应解码后的正文大小（`bytes_saved_basis=decoded_response_body`），不能直接当作代理节省字节。总流量在使用代理中继时仍以中继实际传输为准；直连时使用页面 CDP 统计，缓存命中不计入联网字节。
+- 关闭省流模式后，GptAccount 停用这套资源拦截和共享缓存。首次运行、资源 URL 更新或缓存过期时会联网下载，不能保证每次固定 2 MB。
+
+本地真实 Chrome 验证（仅访问本机测试代理提供的页面）覆盖压缩脚本、跨临时 Profile 命中、资源 URL 更新、关闭省流、Cookie 隔离和 API 始终联网：首次传输 133093 B，缓存命中 2575 B，URL 更新 133093 B，关闭省流 134683 B。复跑：
+
+```powershell
+$env:GPTACCOUNT_BROWSER_TEST = '1'
+.\.venv\Scripts\python.exe -m unittest tests.test_gptaccount_browser.GptAccountCacheBrowserTests -v
+Remove-Item Env:\GPTACCOUNT_BROWSER_TEST
+```
+
+本机在线验证使用当前直连配置，以下数字均为页面 CDP 统计，不代表代理商计费流量：
+
+- 全新缓存加载 ChatGPT 首页：首次 1.557 MiB，下一次全新 Profile 加载 0.297 MiB，命中 295 次，缓存无错误。
+- 已有缓存加载登录页：0.238 MiB，命中 37 次。
+- 完整注册任务 #12 成功，密码、Token 和 36 条 Cookie 已保存；当时缓存尚未覆盖登录后的全部资源，总计 7.421 MiB，命中 99 次、新增 38 个资源。
+- 缓存充分后的完整注册任务 #14 成功：1.488 MiB，缓存命中 213 次、未命中 1 次、缓存无错误；密码、Token 和 38 条 Cookie 均已保存。该次在验证码输入框暂未显示时由原有流程刷新一次后完成。
+
+相关单元测试 59 项、本地真实 Chrome 测试 5 项通过。4 次在线注册中 #12、#14 成功，#11、#13 在密码页失败，失败原因尚未定位；失败样本不计入完整注册的省流结论。#12、#14 的密码提交、验证码验证和创建账号接口均返回 200。以上仅证明本机热缓存条件下能达到约 2 MB 的量级，不保证首次运行、缓存过期或站点更新后的流量和注册成功率。
+
+Review 修复：GptAccount 的 CDP 统计初始化失败时，记录警告、尝试保留 URL 拦截并继续注册，本轮不启用共享缓存；Cookie 快照失败时也尝试停止页面后台下载，仍向主流程报告原快照错误。两处修复均在 GptAccount 独立文件中，相关单元测试增至 60 项。
