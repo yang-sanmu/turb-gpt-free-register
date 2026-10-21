@@ -536,7 +536,15 @@ def _account_filter_sql(
                     f"({normalized_key} = ? OR {normalized_name} IN (?, ?, ?))"
                 )
                 condition_params.extend([canonical, canonical, f"{canonical}plan", f"chatgpt{canonical}plan"])
-            if promo_discount:
+            if promo_discount == "other":
+                # 仅收录明确有效的其他优惠比例，未知/无优惠不归入“其他”。
+                percentage = "json_extract(j.value, '$.metadata.discount.percentage')"
+                conditions.extend([
+                    "json_type(j.value, '$.metadata.discount.percentage') IN ('integer', 'real')",
+                    f"{percentage} > 0 AND {percentage} <= 100",
+                    f"{percentage} NOT IN (50, 100)",
+                ])
+            elif promo_discount:
                 try:
                     discount_value = float(promo_discount.rstrip("%"))
                 except ValueError:
@@ -947,11 +955,12 @@ def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> b
         promo_parts = f.split(":") if f.startswith("promo:") else []
         wanted = promo_parts[1].strip() if len(promo_parts) > 1 else ""
         discount_text = promo_parts[2].strip() if len(promo_parts) > 2 else ""
+        other_discount = discount_text == "other"
         try:
             wanted_discount = float(discount_text.rstrip("%")) if discount_text else None
         except ValueError:
             wanted_discount = None
-        if not wanted and wanted_discount is None:
+        if not wanted and wanted_discount is None and not other_discount:
             return True
 
         def normalize_promo_type(value: Any) -> str:
@@ -970,7 +979,13 @@ def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> b
             discount = metadata.get("discount") if isinstance(metadata, dict) else {}
             percentage = discount.get("percentage") if isinstance(discount, dict) else None
             try:
-                discount_matches = wanted_discount is None or float(percentage) == wanted_discount
+                if other_discount:
+                    discount_matches = (
+                        type(percentage) in (int, float)
+                        and 0 < percentage <= 100 and percentage not in (50, 100)
+                    )
+                else:
+                    discount_matches = wanted_discount is None or float(percentage) == wanted_discount
             except (TypeError, ValueError):
                 discount_matches = False
             if type_matches and discount_matches:

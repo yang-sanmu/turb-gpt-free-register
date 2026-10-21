@@ -186,7 +186,7 @@ class AccountExportTwofaTests(unittest.TestCase):
         self.assertEqual(session.reset_count, 1)
         sleep.assert_not_called()
 
-    def test_reauth_403_is_retried_after_circuit_reset(self):
+    def test_reauth_403_stops_without_circuit_reset(self):
         session = _CircuitSession()
         calls = []
 
@@ -203,13 +203,13 @@ class AccountExportTwofaTests(unittest.TestCase):
         ), patch("config.twofa.TWOFA_REAUTH_RETRY_DELAY", 0), patch.object(
             account_export.time, "sleep"
         ) as sleep:
-            result = account_export._trigger_reauth_with_retry(
-                session, "user@example.com"
-            )
+            with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
+                account_export._trigger_reauth_with_retry(
+                    session, "user@example.com"
+                )
 
-        self.assertEqual(result, "https://auth.example/authorize")
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(session.reset_count, 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(session.reset_count, 0)
         sleep.assert_not_called()
 
     def test_reauth_business_400_is_not_retried(self):
