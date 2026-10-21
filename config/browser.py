@@ -35,7 +35,7 @@ MAC_OS_UA_VERSION = "10_15_7"
 # ---------- curl_cffi 模拟浏览器 ----------
 # curl_cffi 0.15 当前最高内置到 chrome146。UA、Client Hints、JS navigator
 # 必须同步为 146；不能出现 TLS=146、HTTP/JS=149 的跨版本拼接指纹。
-IMPERSONATE = "chrome146"
+IMPERSONATE = "chrome"
 
 # ---------- 桌面 Chrome 画像 ----------
 BROWSER_FAMILY = "chrome"
