@@ -365,7 +365,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,remail,xigua,mailcode",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,remail,xigua,mailcode,icloud",
     },
     {
         "key": "IMAP_MAILBOX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -431,6 +431,14 @@ EDITABLE_FIELDS = [
         "key": "EMAIL_DOMAIN", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "转发域名(cloudflare_domain)", "help": "仅 cloudflare_domain 使用：Email Routing 的域名，如 mydomain.com；与 EMAIL_SOURCE=cloudflare 无关",
     },
+    # ---- iCloud 邮箱（config/icloud.py；转发到 QQ 邮箱，复用下方 QQ 收码配置）----
+    {"key": "ICLOUD_EMAILS", "file": "icloud.py", "type": "list_str_multiline", "group": "邮箱 / OTP",
+     "label": "iCloud 母邮箱(每行一个)", "help": "EMAIL_SOURCE=icloud 时使用；需转发到下方 QQ 邮箱", "storage": "env"},
+    {"key": "ICLOUD_MODE", "file": "icloud.py", "type": "str", "group": "邮箱 / OTP",
+     "label": "iCloud 使用模式", "help": "plus=循环使用母邮箱并追加 +随机后缀（可并行）；direct=每个邮箱只用一次",
+     "choices": [{"value": "plus", "label": "循环 + 随机后缀"}, {"value": "direct", "label": "每个邮箱用一次"}]},
+    {"key": "ICLOUD_PLUS_LENGTH", "file": "icloud.py", "type": "int", "group": "邮箱 / OTP",
+     "label": "iCloud 后缀长度", "help": "plus 模式随机后缀位数，默认 7"},
     {
         "key": "QQ_EMAIL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "QQ 邮箱地址", "help": "仅 cloudflare_domain：接收 Email Routing 转发的 QQ 邮箱，如 123456@qq.com",
@@ -702,6 +710,17 @@ EDITABLE_FIELDS = [
         "key": "EXTRACT_LINK_WORKERS", "file": "extract_link.py", "type": "int", "group": "提链",
         "label": "提链并发数", "help": "批量提链后台线程数，建议 1-4",
     },
+    # ---- 独立提链服务（config/link_providers.py）----
+    {"key": "LINK_PROVIDER", "file": "link_providers.py", "type": "str", "group": "提链",
+     "label": "提链服务", "help": "cdk=上方 CDK 提链服务；nerver_upi=cha.nerver.cc UPI（免鉴权，需填写下方代理池）",
+     "choices": [{"value": "cdk", "label": "CDK 提链服务"}, {"value": "nerver_upi", "label": "Nerver UPI"}]},
+    {"key": "NERVER_UPI_PROXY_POOL", "file": "link_providers.py", "type": "list_str_multiline", "group": "提链",
+     "label": "Nerver UPI 代理池(每行一个)", "help": "作为参数交给 Nerver 服务端使用，需公网可达，建议印度出口；每次随机取一条。请求 Nerver 本身直连。仅保存到 .env",
+     "storage": "env", "secret": True},
+    {"key": "NERVER_UPI_API_BASE", "file": "link_providers.py", "type": "str", "group": "提链",
+     "label": "Nerver UPI 地址", "help": "默认 https://cha.nerver.cc"},
+    {"key": "NERVER_UPI_TIMEOUT", "file": "link_providers.py", "type": "int", "group": "提链",
+     "label": "Nerver UPI 超时(秒)", "help": "单个账号提链的总等待时间，默认 300"},
     # ---- Codex 配置 ----
     {
         "key": "SUB2API_AUTO_EXPORT", "file": "sub2api.py", "type": "bool", "group": "Codex",

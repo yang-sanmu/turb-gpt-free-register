@@ -216,6 +216,8 @@ _RELOADABLE_SUBMODULES = (
     "config.flow_trigger",
     "config.codex",
     "config.extract_link",
+    "config.link_providers",
+    "config.icloud",
     "config.sub2api",
     "config.humanize",
 )

@@ -22,7 +22,7 @@ from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
-_VALID_SOURCES = ("outlook", "generic_api", "imap", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "remail", "xigua", "mailcode")
+_VALID_SOURCES = ("outlook", "generic_api", "imap", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "remail", "xigua", "mailcode", "icloud")
 
 
 def parse_email_sources(value=None) -> list[str]:
@@ -60,6 +60,9 @@ def _pick_from_source(source: str) -> str:
     if source == "cloudflare_domain":
         from core.qqmail_client import pick_domain_email
         return pick_domain_email()
+    if source == "icloud":
+        from core.icloud_mail_client import pick_email
+        return pick_email()
     if source == "generic_api":
         from core.generic_api_mail_client import pick_account
         return pick_account().email
@@ -162,6 +165,10 @@ def resolve_email_source(email: str) -> str:
     from core.xigua_client import get_account_context as get_xigua_context
     if get_xigua_context(email):
         return "xigua"
+
+    from core.icloud_mail_client import is_known_email
+    if is_known_email(email):
+        return "icloud"
 
     from core import db
     if db.get_imap_email_by_email(email):
@@ -269,6 +276,9 @@ def wait_for_otp(
     if source == "cloudflare_domain":
         from core.qqmail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "icloud":
+        from core.icloud_mail_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "generic_api":
         from core.generic_api_mail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
@@ -322,6 +332,9 @@ def release_email(email: str, status: str = "available", note: str | None = None
     elif source == "cloudflare_domain":
         from core.qqmail_client import release_domain_email
         release_domain_email(email, status=status, note=note)
+    elif source == "icloud":
+        from core.icloud_mail_client import release_email as release_icloud_email
+        release_icloud_email(email, status=status, note=note)
     elif source == "generic_api":
         from core.generic_api_mail_client import release_account
         release_account(email, status=status, note=note)

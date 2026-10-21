@@ -266,12 +266,17 @@ def _format_failure_reason(exc: Exception, logs: list[str] | None = None, last_e
     return reason[:500]
 
 
-def _run_extract(*, account_id: int, email: str, access_token: str, link_type: str, cdk: str, trigger: str) -> dict:
+def _run_extract(*, account_id: int, email: str, access_token: str, link_type: str, cdk: str, trigger: str, provider=None) -> dict:
     logs: list[str] = []
     last_event = None
     try:
         if not db.mark_account_extract_running(account_id):
             return {"ok": False, "error": "账号已删除或提链状态已被重置"}
+        if provider is not None:
+            final = provider.run(account_id=account_id, access_token=access_token)
+            db.update_account_extract(account_id, final)
+            logger.info("[提链] 成功: %s provider=%s", email, provider.name)
+            return final
         job = _create_extract_job(token=access_token, link_type=link_type, cdk=cdk)
         job_id = str(job.get("job_id") or "")
         db.update_account_extract(account_id, {
@@ -332,12 +337,14 @@ def enqueue_account_extract(*, account_id: int, email: str, access_token: str, t
     if not _QUEUE_SLOTS.acquire(blocking=False):
         return {"accepted": False, "busy": False, "error": "提链队列已满"}
     try:
-        lt = _link_type(link_type)
-        code = _cdk(cdk)
+        from core import link_providers
+        provider = link_providers.active()
+        lt = provider.link_type if provider else _link_type(link_type)
+        code = "" if provider else _cdk(cdk)
         if not db.claim_account_extract(account_id, trigger=trigger, link_type=lt):
             _QUEUE_SLOTS.release()
             return {"accepted": False, "busy": True, "error": "该账号正在提链中"}
-        fut = _EXECUTOR.submit(_run_extract, account_id=account_id, email=email, access_token=access_token, link_type=lt, cdk=code, trigger=trigger)
+        fut = _EXECUTOR.submit(_run_extract, account_id=account_id, email=email, access_token=access_token, link_type=lt, cdk=code, trigger=trigger, provider=provider)
         return {"accepted": True, "busy": False, "future": fut, "link_type": lt}
     except Exception:
         _QUEUE_SLOTS.release()

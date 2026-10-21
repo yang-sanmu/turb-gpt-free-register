@@ -2705,7 +2705,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                     "ok": False,
                     "error": "Remail 服务模式只能填写 code 或 purchase（配置 → 邮箱 / OTP）。",
                 }), 400
-        if "mailcode" in sources or "gptmail" in sources or "mailnest" in sources or "cloudmail" in sources or "remail" in sources or "xigua" in sources or "cloudflare" in sources:
+        if "mailcode" in sources or "gptmail" in sources or "mailnest" in sources or "cloudmail" in sources or "remail" in sources or "xigua" in sources or "cloudflare" in sources or "icloud" in sources:
             # 临时邮箱在任务开始时动态生成，不需要本地邮箱池容量提示。
             warning = ""
         elif "cloudflare_domain" in sources:
