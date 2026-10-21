@@ -190,6 +190,17 @@ class GptAccountDriverTests(unittest.TestCase):
             self.assertEqual(row["access_token"], "fixture-token")
             self.assertEqual(twofa.call_args.kwargs["proxy"], "http://proxy.example:80")
 
+    def test_capture_closes_old_pages_after_snapshot(self):
+        old, fresh = Mock(), Mock()
+        context = Mock(pages=[old])
+        context.storage_state.return_value = {"cookies": [], "origins": []}
+        context.new_page.return_value = fresh
+        driver = SimpleNamespace(context=context, page=old)
+        snapshot = capture_browser_state(driver)
+        self.assertEqual(snapshot["storage_state"], {"cookies": [], "origins": []})
+        old.close.assert_called_once()
+        self.assertIs(driver.page, fresh)
+
 
 if __name__ == "__main__":
     unittest.main()

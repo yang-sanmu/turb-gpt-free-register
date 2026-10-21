@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from config import gptaccount as cfg
-from core.cloakbrowser_driver import CloakOpenResult, CloakSeleniumDriver
+from core.cloakbrowser_driver import CloakElement, CloakOpenResult, CloakSeleniumDriver
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +134,33 @@ class GptAccountBridge:
         return self.cleanup_result
 
 
+class GptAccountElement(CloakElement):
+    """Selenium send_keys appends at the caret.
+
+    CloakElement.send_keys uses fill(), which replaces the value, so the shared
+    flow's per-character typing left only the last character in plain Chrome.
+    """
+
+    def send_keys(self, *values: str) -> None:
+        text = "".join(str(v or "") for v in values)
+        keyboard = self.page.keyboard
+        if "" in text or "" in text:  # Keys.CONTROL / Keys.COMMAND + "a"
+            self._eval("el => el.focus()")
+            keyboard.press("Control+A")
+        elif "" in text:  # Keys.BACKSPACE; keep any selection from Ctrl+A
+            keyboard.press("Backspace")
+        else:
+            self._eval("el => { el.focus(); const n = (el.value || '').length;"
+                       " try { el.setSelectionRange(n, n); } catch (e) {} }")
+            keyboard.type(text)
+
+
+def _as_gptaccount_element(value):
+    if isinstance(value, CloakElement) and not isinstance(value, GptAccountElement):
+        return GptAccountElement(value.page, value.locator, value.handle)
+    return value
+
+
 class GptAccountDriver(CloakSeleniumDriver):
     def __init__(self, *, bridge, playwright, browser, context, page, proxy_relay):
         super().__init__(browser, context, page, proxy_relay)
@@ -141,6 +168,29 @@ class GptAccountDriver(CloakSeleniumDriver):
         self._playwright = playwright
         self._quit_done = False
         self._registration_log_prefix = "[GptAccount注册]"
+
+    def find_elements(self, by, selector):
+        return [_as_gptaccount_element(el) for el in super().find_elements(by, selector)]
+
+    @staticmethod
+    def _unwrap_js_result(page, handle):
+        # json_value() turns DOM nodes inside {ok, button: el} into "ref: <Node>";
+        # the shared flow then calls .click() on a string. Keep them as elements.
+        nested = {}
+        try:
+            if handle.as_element() is None:
+                for key, prop in handle.get_properties().items():
+                    element = prop.as_element()
+                    if element is not None:
+                        nested[key] = GptAccountElement(page, handle=element)
+                    else:
+                        prop.dispose()
+        except Exception:
+            nested = {}
+        result = _as_gptaccount_element(CloakSeleniumDriver._unwrap_js_result(page, handle))
+        if nested and isinstance(result, dict):
+            result.update(nested)
+        return result
 
     def quit(self):
         if self._quit_done:

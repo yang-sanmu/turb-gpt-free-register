@@ -56,8 +56,16 @@ class RealGptAccountBrowserTests(unittest.TestCase):
                     runtime = Path(driver._bridge.runtime_dir)
                     self.assertTrue(runtime.is_dir())
                     driver.get("http://registration-fixture.invalid/")
-                    driver.page.locator("input").fill("fixture@example.com")
-                    driver.page.get_by_role("button", name="Save").click()
+                    # The shared flow types char by char via Selenium-style send_keys.
+                    from core.roxy_registration import _human_type_text
+                    field = driver.find_element("css selector", "input")
+                    _human_type_text(driver, field, "stale", clear=False)
+                    _human_type_text(driver, field, "fixture@example.com", clear=True)
+                    self.assertEqual(driver.page.locator("input").input_value(), "fixture@example.com")
+                    # The shared flow clicks DOM nodes returned inside result objects.
+                    found = driver.execute_script("return {ok: true, button: document.querySelector('button')};")
+                    self.assertTrue(found["ok"])
+                    found["button"].click()
                     self.assertEqual(driver.page.title(), "fixture@example.com")
                     self.assertEqual(driver.page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone"), "Asia/Tokyo")
                     driver.page.evaluate("localStorage.setItem('fixture_key', 'fixture_value')")
