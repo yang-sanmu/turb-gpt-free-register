@@ -435,10 +435,10 @@ EDITABLE_FIELDS = [
     {"key": "ICLOUD_EMAILS", "file": "icloud.py", "type": "list_str_multiline", "group": "邮箱 / OTP",
      "label": "iCloud 母邮箱(每行一个)", "help": "EMAIL_SOURCE=icloud 时使用；需转发到下方 QQ 邮箱", "storage": "env"},
     {"key": "ICLOUD_MODE", "file": "icloud.py", "type": "str", "group": "邮箱 / OTP",
-     "label": "iCloud 使用模式", "help": "plus=循环使用母邮箱并追加 +随机后缀（可并行）；direct=每个邮箱只用一次",
-     "choices": [{"value": "plus", "label": "循环 + 随机后缀"}, {"value": "direct", "label": "每个邮箱用一次"}]},
+     "label": "iCloud 使用模式", "help": "plus=循环追加随机后缀；direct=完整地址匹配，每个邮箱只用一次；plus_once=每个母邮箱固定一个后缀，失败回收后沿用，已有同母邮箱子账号则跳过，裸母邮箱账号不影响，耗尽时报错",
+     "choices": [{"value": "plus", "label": "循环 + 随机后缀"}, {"value": "direct", "label": "每个邮箱用一次"}, {"value": "plus_once", "label": "每个邮箱用一次 + 固定随机后缀"}]},
     {"key": "ICLOUD_PLUS_LENGTH", "file": "icloud.py", "type": "int", "group": "邮箱 / OTP",
-     "label": "iCloud 后缀长度", "help": "plus 模式随机后缀位数，默认 7"},
+     "label": "iCloud 后缀长度", "help": "plus / plus_once 新后缀位数，默认 7；已生成的固定后缀不变"},
     {
         "key": "QQ_EMAIL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "QQ 邮箱地址", "help": "仅 cloudflare_domain：接收 Email Routing 转发的 QQ 邮箱，如 123456@qq.com",

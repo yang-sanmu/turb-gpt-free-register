@@ -378,6 +378,9 @@ def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
         changed = db.release_unconsumed_imap_email(email, note=note)
     elif source == "cloudflare_domain":
         changed = db.release_unconsumed_domain_email(email, note=note)
+    elif source == "icloud":
+        from core.icloud_mail_client import release_email_if_unconsumed as release_icloud_if_unconsumed
+        changed = release_icloud_if_unconsumed(email, note=note)
     else:
         # 临时邮箱不重新进入本地池，只清理进程上下文；已有本地账号时保留上下文。
         if db.get_account_by_email(email) is not None:

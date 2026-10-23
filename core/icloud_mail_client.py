@@ -28,6 +28,7 @@ from core.qqmail_client import _connect_imap, _decode_email_header, _msg_to_dict
 logger = logging.getLogger(__name__)
 
 _TABLE = "icloud_email_usage"
+_FIXED_ALIAS_TABLE = "icloud_fixed_aliases"
 _ROUND_ROBIN = itertools.count(random.randrange(1000))
 _RECIPIENT_HEADERS = ("To", "Sender", "X-QQ-CSender", "Return-Path", "Authentication-Results", "Received-SPF")
 _RECENT_MESSAGES = 40
@@ -68,30 +69,68 @@ def _record(conn, email: str, base: str, status: str, note: str | None = None) -
     )
 
 
+def _plus_base(email: str) -> str | None:
+    local, _, domain = str(email or "").strip().lower().partition("@")
+    base, plus, suffix = local.partition("+")
+    return f"{base}@{domain}" if base and plus and suffix and domain else None
+
+
 def pick_email() -> str:
     mode = str(cfg.ICLOUD_MODE or "plus").strip().lower()
-    if mode not in ("direct", "plus"):
-        raise ICloudMailError(f"ICLOUD_MODE={mode!r} 无效，可选 direct / plus")
+    if mode not in ("direct", "plus", "plus_once"):
+        raise ICloudMailError(f"ICLOUD_MODE={mode!r} 无效，可选 direct / plus / plus_once")
     bases = _bases()
     with db._LOCK, closing(_conn()) as conn, conn:
-        if mode == "direct":
+        if mode in ("direct", "plus_once"):
+            aliases = {}
+            if mode == "plus_once":
+                db._ensure_sqlite()
+                # Python 锁只保护当前进程；数据库事务覆盖检查与领取，避免多进程重复领取。
+                conn.execute("BEGIN IMMEDIATE")
+                # 独立保存映射，回收只改 usage 状态；重试、重启和配置变更都不换后缀。
+                conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {_FIXED_ALIAS_TABLE} ("
+                    "base TEXT PRIMARY KEY COLLATE NOCASE, email TEXT UNIQUE COLLATE NOCASE NOT NULL)"
+                )
+                aliases = dict(conn.execute(f"SELECT base, email FROM {_FIXED_ALIAS_TABLE}"))
             taken = {r[0].lower() for r in conn.execute(f"SELECT email FROM {_TABLE} WHERE status != 'available'")}
+            if mode == "plus_once":
+                # 只按子邮箱的母邮箱归并；裸母邮箱账号及其使用状态不占用子邮箱名额。
+                taken_plus_bases = {
+                    plus_base
+                    for addr in itertools.chain(taken, (r[0] for r in conn.execute("SELECT email FROM accounts WHERE instr(email, '+') > 0")))
+                    if (plus_base := _plus_base(addr)) is not None
+                }
             for base in bases:
-                if base not in taken and db.get_account_by_email(base) is None:
-                    _record(conn, base, base, "used")
-                    logger.info("[iCloud] 领取邮箱: %s", base)
-                    return base
+                addr = aliases.get(base, base)
+                if mode == "direct":
+                    if base in taken or db.get_account_by_email(base) is not None:
+                        continue
+                elif base in taken_plus_bases:
+                    continue
+                if mode == "plus_once" and base not in aliases:
+                    addr = _new_plus_email(conn, base, check_account=True)
+                    conn.execute(f"INSERT INTO {_FIXED_ALIAS_TABLE}(base, email) VALUES(?,?)", (base, addr))
+                _record(conn, addr, base, "used")
+                logger.info("[iCloud] 领取邮箱: %s", addr)
+                return addr
             raise ICloudMailError(f"ICLOUD_EMAILS 中 {len(bases)} 个邮箱均已使用，请补充或切换 plus 模式")
 
-        length = max(4, min(16, int(cfg.ICLOUD_PLUS_LENGTH or 7)))
         base = bases[next(_ROUND_ROBIN) % len(bases)]
-        local, domain = base.split("@", 1)
-        for _ in range(20):
-            suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
-            addr = f"{local}+{suffix}@{domain}"
-            if conn.execute(f"SELECT 1 FROM {_TABLE} WHERE email=?", (addr,)).fetchone() is None:
-                _record(conn, addr, base, "used")
-                logger.info("[iCloud] 生成子邮箱: %s", addr)
+        addr = _new_plus_email(conn, base)
+        _record(conn, addr, base, "used")
+        logger.info("[iCloud] 生成子邮箱: %s", addr)
+        return addr
+
+
+def _new_plus_email(conn, base: str, *, check_account: bool = False) -> str:
+    length = max(4, min(16, int(cfg.ICLOUD_PLUS_LENGTH or 7)))
+    local, domain = base.split("@", 1)
+    for _ in range(20):
+        suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+        addr = f"{local}+{suffix}@{domain}"
+        if conn.execute(f"SELECT 1 FROM {_TABLE} WHERE email=?", (addr,)).fetchone() is None:
+            if not check_account or db.get_account_by_email(addr) is None:
                 return addr
     raise ICloudMailError("生成 iCloud 子邮箱失败：随机后缀连续冲突")
 
@@ -109,6 +148,19 @@ def release_email(email: str, status: str = "available", note: str | None = None
     with db._LOCK, closing(_conn()) as conn, conn:
         row = conn.execute(f"SELECT base FROM {_TABLE} WHERE email=?", (email,)).fetchone()
         _record(conn, email, row[0] if row else email.split("+", 1)[0], status, note)
+
+
+def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
+    """任务兜底只回收未落库且仍为 used 的领取，保留已判废状态及固定后缀。"""
+    email = str(email or "").strip().lower()
+    with db._LOCK, closing(_conn()) as conn, conn:
+        if db.get_account_by_email(email) is not None:
+            return False
+        changed = conn.execute(
+            f"UPDATE {_TABLE} SET status='available', note=?, updated_at=? WHERE email=? AND status='used'",
+            (note, datetime.now().isoformat(timespec="seconds"), email),
+        )
+        return changed.rowcount > 0
 
 
 def is_addressed_to(header_text: str, to_text: str, email: str) -> bool:

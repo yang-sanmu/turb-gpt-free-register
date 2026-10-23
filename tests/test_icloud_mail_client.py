@@ -1,6 +1,11 @@
+import importlib
+import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, nullcontext
 from pathlib import Path
+from threading import Barrier, BrokenBarrierError
 from unittest.mock import patch
 
 from config import icloud as cfg
@@ -41,13 +46,16 @@ class PickTests(unittest.TestCase):
         patcher = patch("core.db._active_sqlite_path", return_value=db_path)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name, value in (("_ensure_storage", None),):
+        for name, value in (("_ensure_storage", None), ("_ensure_sqlite", None)):
             p = patch(f"core.db.{name}", return_value=value)
             p.start()
             self.addCleanup(p.stop)
-        p = patch("core.db.get_account_by_email", return_value=None)
-        p.start()
-        self.addCleanup(p.stop)
+        with closing(client.db._sqlite_conn()) as conn, conn:
+            conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT NOT NULL, payload TEXT NOT NULL)")
+
+    def save_account(self, email):
+        with closing(client.db._sqlite_conn()) as conn, conn:
+            conn.execute("INSERT INTO accounts(email, payload) VALUES(?,?)", (email, json.dumps({"email": email})))
 
     def test_plus_mode_round_robins_with_unique_suffix(self):
         with patch.multiple(cfg, ICLOUD_EMAILS=["A.one@icloud.com", "b.two+old@icloud.com"], ICLOUD_MODE="plus", ICLOUD_PLUS_LENGTH=7):
@@ -70,6 +78,190 @@ class PickTests(unittest.TestCase):
                 client.pick_email()
             client.release_email(first, status="available")
             self.assertEqual(client.pick_email(), first)
+
+    def test_plus_once_uses_each_base_once_and_exhausts(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["ONE@icloud.com", "one+old@icloud.com", "two@icloud.com"], ICLOUD_MODE="plus_once", ICLOUD_PLUS_LENGTH=7):
+            first, second = client.pick_email(), client.pick_email()
+            self.assertRegex(first, r"^one\+[a-z0-9]{7}@icloud\.com$")
+            self.assertRegex(second, r"^two\+[a-z0-9]{7}@icloud\.com$")
+            with self.assertRaisesRegex(client.ICloudMailError, "2 个邮箱均已使用"):
+                client.pick_email()
+            self.assertTrue(client.is_known_email(first))
+            client.release_email(first, status="available")
+            self.assertEqual(client.pick_email(), first)
+            with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                client.pick_email()
+
+    def test_plus_once_reuses_suffix_after_reload_and_length_change(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["one@icloud.com"], ICLOUD_MODE="plus_once", ICLOUD_PLUS_LENGTH=7):
+            first = client.pick_email()
+            client.release_email(first)
+            importlib.reload(client)
+            with patch.object(cfg, "ICLOUD_PLUS_LENGTH", 12), \
+                    patch.object(client.random, "choices", side_effect=AssertionError("固定后缀不应重新生成")):
+                for _ in range(3):
+                    self.assertEqual(client.pick_email(), first)
+                    client.release_email(first)
+
+    def test_plus_once_provider_recycles_failure_but_not_registered_email(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["one@icloud.com"], ICLOUD_MODE="plus_once"), \
+                patch.object(email_provider, "resolve_email_source", return_value="icloud"):
+            first = email_provider.acquire_email_from_source("icloud")
+            self.assertTrue(email_provider.release_email_if_unconsumed(first, note="注册失败"))
+            self.assertEqual(email_provider.acquire_email_from_source("icloud"), first)
+            self.save_account(first)
+            self.assertFalse(email_provider.release_email_if_unconsumed(first))
+            with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                client.pick_email()
+
+    def test_plus_once_provider_only_reclaims_used_email(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["one@icloud.com"], ICLOUD_MODE="plus_once"), \
+                patch.object(email_provider, "resolve_email_source", return_value="icloud"):
+            first = client.pick_email()
+            for status in ("available", "failed", "disabled"):
+                with self.subTest(status=status):
+                    client.release_email(first, status=status, note="保留原状态")
+                    self.assertFalse(email_provider.release_email_if_unconsumed(first, note="任务兜底回收"))
+                    with closing(client._conn()) as conn:
+                        row = conn.execute(f"SELECT status, note FROM {client._TABLE} WHERE email=?", (first,)).fetchone()
+                    self.assertEqual(tuple(row), (status, "保留原状态"))
+                    if status != "available":
+                        with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                            client.pick_email()
+            self.assertFalse(email_provider.release_email_if_unconsumed("unknown@icloud.com"))
+            self.assertFalse(client.is_known_email("unknown@icloud.com"))
+
+    def test_plus_once_skips_registered_alias_even_if_released(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["one@icloud.com", "two@icloud.com"], ICLOUD_MODE="plus_once"):
+            first = client.pick_email()
+            client.release_email(first)
+            self.save_account(first)
+            self.assertTrue(client.pick_email().startswith("two+"))
+            with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                client.pick_email()
+
+    def test_plus_once_ignores_consumed_or_registered_bare_base(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["used@icloud.com", "saved@icloud.com", "free@icloud.com"], ICLOUD_MODE="plus_once"):
+            client.release_email("used@icloud.com", status="used")
+            self.save_account("saved@icloud.com")
+            self.assertTrue(client.pick_email().startswith("used+"))
+            self.assertTrue(client.pick_email().startswith("saved+"))
+            self.assertTrue(client.pick_email().startswith("free+"))
+            with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                client.pick_email()
+
+    def test_plus_once_skips_other_registered_suffix_before_generating(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["aaa@icloud.com", "bbb@icloud.com"], ICLOUD_MODE="plus_once"):
+            self.save_account("AAA+cc@ICLOUD.COM")
+            with patch.object(client.random, "choices", return_value=list("bbbbbbb")) as choices:
+                self.assertEqual(client.pick_email(), "bbb+bbbbbbb@icloud.com")
+                with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                    client.pick_email()
+            choices.assert_called_once()
+
+    def test_plus_once_skips_other_registered_suffix_on_retry(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["aaa@icloud.com"], ICLOUD_MODE="plus_once"):
+            first = client.pick_email()
+            client.release_email(first)
+            self.save_account("aaa+old@icloud.com")
+            with patch.object(client.random, "choices", side_effect=AssertionError("不可另换后缀")):
+                with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                    client.pick_email()
+
+    def test_plus_once_skips_unavailable_child_from_another_suffix(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["aaa@icloud.com"], ICLOUD_MODE="plus_once"):
+            for status in ("used", "failed", "disabled"):
+                with self.subTest(status=status):
+                    client.release_email("aaa+old@icloud.com", status=status)
+                    with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                        client.pick_email()
+
+    def test_plus_once_matches_entire_base_and_domain(self):
+        for email in ("xaaa+cc@icloud.com", "aaa2+cc@icloud.com", "aaa+cc@me.com", "aaa+cc@icloud.com.other"):
+            self.save_account(email)
+        with patch.multiple(cfg, ICLOUD_EMAILS=["aaa@icloud.com"], ICLOUD_MODE="plus_once"):
+            self.assertTrue(client.pick_email().startswith("aaa+"))
+
+    def test_direct_mode_matches_exact_address_only(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["saved@icloud.com", "aaa@icloud.com"], ICLOUD_MODE="direct"):
+            self.save_account("saved@icloud.com")
+            self.save_account("aaa+cc@icloud.com")
+            client.release_email("aaa+old@icloud.com", status="used")
+            self.assertEqual(client.pick_email(), "aaa@icloud.com")
+            with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                client.pick_email()
+
+    def test_plus_once_respects_unavailable_statuses(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["one@icloud.com"], ICLOUD_MODE="plus_once"):
+            first = client.pick_email()
+            for status in ("used", "failed", "disabled"):
+                with self.subTest(status=status):
+                    client.release_email(first, status=status)
+                    with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
+                        client.pick_email()
+
+    def test_plus_once_parallel_claims_never_duplicate_a_base(self):
+        def pick_or_none(_):
+            try:
+                return client.pick_email()
+            except client.ICloudMailError:
+                return None
+
+        with patch.multiple(cfg, ICLOUD_EMAILS=[f"box{i}@icloud.com" for i in range(4)], ICLOUD_MODE="plus_once"):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                picked = [addr for addr in pool.map(pick_or_none, range(16)) if addr]
+            self.assertEqual(len(picked), 4)
+            self.assertEqual({addr.split("+")[0] for addr in picked}, {f"box{i}" for i in range(4)})
+            client.release_email(picked[0])
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                retried = [addr for addr in pool.map(pick_or_none, range(16)) if addr]
+            self.assertEqual(retried, [picked[0]])
+
+    def test_plus_once_claim_is_atomic_without_a_shared_process_lock(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["one@icloud.com"], ICLOUD_MODE="plus_once"):
+            first = client.pick_email()
+            client.release_email(first)
+            self.save_account("other+saved@icloud.com")
+            readers = Barrier(2)
+            plus_base = client._plus_base
+
+            def synchronize_readers(addr):
+                if addr == "other+saved@icloud.com":
+                    # 旧逻辑会让两个调度器都先读到 available；事务保护后后者等待前者提交。
+                    try:
+                        readers.wait(timeout=1)
+                    except BrokenBarrierError:
+                        pass
+                return plus_base(addr)
+
+            def pick_or_none(_):
+                try:
+                    return client.pick_email()
+                except client.ICloudMailError:
+                    return None
+
+            # 独立进程不共享 db._LOCK；保留真实 SQLite 连接验证数据库层的互斥。
+            with patch.object(client.db, "_LOCK", nullcontext()), \
+                    patch.object(client, "_plus_base", side_effect=synchronize_readers):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    picked = list(pool.map(pick_or_none, range(2)))
+            self.assertEqual([addr for addr in picked if addr], [first])
+
+    def test_plus_once_keeps_its_mapping_when_switching_modes(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["one@icloud.com"], ICLOUD_MODE="plus_once"):
+            first = client.pick_email()
+            client.release_email(first)
+            with patch.object(cfg, "ICLOUD_MODE", "plus"):
+                other = client.pick_email()
+                self.assertNotEqual(other, first)
+                client.release_email(other)
+            self.assertEqual(client.pick_email(), first)
+
+    def test_plus_once_avoids_existing_available_usage_collision(self):
+        with patch.multiple(cfg, ICLOUD_EMAILS=["one@icloud.com"], ICLOUD_MODE="plus_once", ICLOUD_PLUS_LENGTH=7):
+            client.release_email("one+aaaaaaa@icloud.com")
+            with patch.object(client.random, "choices", side_effect=[list("aaaaaaa"), list("bbbbbbb")]):
+                self.assertEqual(client.pick_email(), "one+bbbbbbb@icloud.com")
 
     def test_empty_list_and_bad_mode(self):
         with patch.multiple(cfg, ICLOUD_EMAILS=[], ICLOUD_MODE="plus"):
