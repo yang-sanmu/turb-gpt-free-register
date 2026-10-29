@@ -59,25 +59,56 @@ def _nerver_result(data: dict) -> dict:
     }
 
 
+def _nerver_final(data) -> dict:
+    """非流式 JSON 与 SSE done 使用相同的结果结构和校验。"""
+    if not isinstance(data, dict):
+        raise RuntimeError("Nerver UPI 响应格式无效，预期 JSON 对象")
+    if not data.get("ok"):
+        detail = "；".join(str(x) for x in (data.get("message"), data.get("error")) if x)
+        raise RuntimeError(f"Nerver UPI 失败 {data.get('reason') or ''} {detail}".strip())
+    result = _nerver_result(data)
+    if not (result["long_url"] or result["copy_paste"] or result["image_url_png"]):
+        raise RuntimeError(f"Nerver UPI 返回成功但没有链接/二维码 request_id={data.get('request_id')}")
+    return {
+        "ok": True, "status": "success", "link_type": "upi",
+        "job_id": data.get("request_id"), "result": result,
+    }
+
+
 def run_nerver_upi(*, account_id: int, access_token: str) -> dict:
-    """调用 Nerver /api/v1/upi/stream。请求直连；代理仅作为参数交给服务端。"""
+    """按配置调用 Nerver 流式或非流式接口。请求直连；代理仅作为服务端参数。"""
+    mode = str(cfg.NERVER_UPI_MODE or "stream").strip().lower()
+    if mode not in ("stream", "json"):
+        raise ValueError("NERVER_UPI_MODE 无效，仅支持 stream / json")
+    streaming = mode == "stream"
     pool = [p for p in (normalize_proxy_url(x) for x in cfg.NERVER_UPI_PROXY_POOL) if p]
     if not pool:
         raise ValueError("NERVER_UPI_PROXY_POOL 为空；Nerver UPI 免鉴权模式需要提供代理")
-    url = f"{str(cfg.NERVER_UPI_API_BASE).strip().rstrip('/')}/api/v1/upi/stream"
+    endpoint = "/api/v1/upi/stream" if streaming else "/api/v1/upi"
+    url = f"{str(cfg.NERVER_UPI_API_BASE).strip().rstrip('/')}{endpoint}"
     deadline = time.monotonic() + max(30, int(cfg.NERVER_UPI_TIMEOUT))
     s = curl_requests.Session(trust_env=False)
     try:
         resp = s.post(
             url,
             json={"token": access_token, "proxy": random.choice(pool)},
-            headers={"Accept": "text/event-stream"},
+            headers={"Accept": "text/event-stream" if streaming else "application/json"},
             timeout=(15, max(30, int(cfg.NERVER_UPI_TIMEOUT))),
-            stream=True,
+            stream=streaming,
         )
         if resp.status_code != 200:
-            body = b"".join(x if isinstance(x, bytes) else str(x).encode() for x in resp.iter_lines())
-            raise RuntimeError(f"Nerver UPI HTTP {resp.status_code}: {body.decode('utf-8', 'replace')[:300]}")
+            if streaming:
+                body = b"".join(x if isinstance(x, bytes) else str(x).encode() for x in resp.iter_lines())
+                detail = body.decode("utf-8", "replace")
+            else:
+                detail = resp.text
+            raise RuntimeError(f"Nerver UPI HTTP {resp.status_code}: {detail[:300]}")
+        if not streaming:
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise RuntimeError("Nerver UPI 非流式接口返回无效 JSON") from exc
+            return _nerver_final(data)
         for event, data in _iter_sse(resp):
             if time.monotonic() > deadline:
                 raise TimeoutError(f"Nerver UPI 超过 {cfg.NERVER_UPI_TIMEOUT} 秒未返回结果")
@@ -87,17 +118,7 @@ def run_nerver_upi(*, account_id: int, access_token: str) -> dict:
                     "message": f"UPI: {data.get('step')}",
                 })
             elif event == "done":
-                data = data if isinstance(data, dict) else {}
-                if not data.get("ok"):
-                    detail = "；".join(str(x) for x in (data.get("message"), data.get("error")) if x)
-                    raise RuntimeError(f"Nerver UPI 失败 {data.get('reason') or ''} {detail}".strip())
-                result = _nerver_result(data)
-                if not (result["long_url"] or result["copy_paste"] or result["image_url_png"]):
-                    raise RuntimeError(f"Nerver UPI 返回成功但没有链接/二维码 request_id={data.get('request_id')}")
-                return {
-                    "ok": True, "status": "success", "link_type": "upi",
-                    "job_id": data.get("request_id"), "result": result,
-                }
+                return _nerver_final(data)
         raise RuntimeError("Nerver UPI 事件流结束但未返回 done")
     finally:
         s.close()

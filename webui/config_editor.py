@@ -719,6 +719,9 @@ EDITABLE_FIELDS = [
      "storage": "env", "secret": True},
     {"key": "NERVER_UPI_API_BASE", "file": "link_providers.py", "type": "str", "group": "提链",
      "label": "Nerver UPI 地址", "help": "默认 https://cha.nerver.cc"},
+    {"key": "NERVER_UPI_MODE", "file": "link_providers.py", "type": "str", "group": "提链",
+     "label": "Nerver UPI 接口模式", "help": "流式显示中间步骤；非流式等待最终结果，建议超时至少 300 秒",
+     "choices": [{"value": "stream", "label": "流式（实时进度）"}, {"value": "json", "label": "非流式（等待结果）"}]},
     {"key": "NERVER_UPI_TIMEOUT", "file": "link_providers.py", "type": "int", "group": "提链",
      "label": "Nerver UPI 超时(秒)", "help": "单个账号提链的总等待时间，默认 300"},
     # ---- Codex 配置 ----

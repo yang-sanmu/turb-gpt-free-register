@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""本地 AT 过期巡检；仅失效账号调用查活（同会话自动查套餐）。"""
+"""持久化账号批量任务：AT 巡检、全量查套餐、全量查活刷新 AT。"""
 from __future__ import annotations
 
 import logging
@@ -12,7 +12,7 @@ from contextlib import contextmanager
 
 from core.inspection_lease import acquire_inspection_lease
 
-from core import db, live_check_service
+from core import db, live_check_service, plan_check_service
 from core.chatgpt_plan import decode_jwt_payload_unverified, normalize_token
 
 logger = logging.getLogger(__name__)
@@ -39,19 +39,30 @@ def token_needs_refresh(token: str, now: float | None = None) -> bool:
         return True
 
 
-def _check_live(account: dict, executor: ThreadPoolExecutor) -> dict:
+def _check_live(account: dict, executor: ThreadPoolExecutor, trigger: str = "inspection") -> dict:
     queued = live_check_service.enqueue_account_live_check(
         account_id=account["id"], email=account.get("email", ""),
-        trigger="inspection", return_future=True, executor=executor,
+        trigger=trigger, return_future=True, executor=executor,
     )
     if not queued.get("accepted"):
         return {"ok": False, "status": "rejected", "error": queued.get("error") or "查活入队被拒绝"}
     return queued["future"].result()
 
 
+def _check_plan(account: dict, executor: ThreadPoolExecutor) -> dict:
+    queued = plan_check_service.enqueue_account_plan_check(
+        account_id=account["id"], email=account.get("email", ""),
+        access_token=account.get("access_token", ""), trigger="one_click_plan",
+        return_future=True, executor=executor,
+    )
+    if not queued.get("accepted"):
+        return {"ok": False, "status": "rejected", "error": queued.get("error") or "套餐查询入队被拒绝"}
+    return queued["future"].result()
+
+
 def validate_workers(workers: int) -> int:
     if type(workers) is not int or not 1 <= workers <= MAX_WORKERS:
-        raise ValueError(f"巡检线程数必须为 1–{MAX_WORKERS} 的整数")
+        raise ValueError(f"任务线程数必须为 1–{MAX_WORKERS} 的整数")
     return workers
 
 
@@ -66,6 +77,9 @@ def _run(run: dict) -> None:
     run["total_count"] = len(account_ids)
     run.setdefault("skipped_count", 0)
     run.setdefault("deactivated_skipped_count", 0)
+    run.setdefault("processed_count", 0)
+    run.setdefault("failure_count", 0)
+    mode = run.get("mode", "inspection")
     pending = iter(account_ids)
     claim_lock = threading.Lock()
     stats_lock = threading.Lock()
@@ -74,9 +88,11 @@ def _run(run: dict) -> None:
     def persist(failure=None):
         saved = db.save_account_inspection(run, failure=failure) if failure is not None else db.save_account_inspection(run)
         if not saved:
-            raise InspectionStopped("巡检任务已结束或被中断")
+            raise InspectionStopped("账号任务已结束或被中断")
 
     def record(*, failure=None, **counts):
+        if failure is not None:
+            counts["failure_count"] = 1
         with stats_lock:
             previous = {key: run[key] for key in counts}
             for key, value in counts.items():
@@ -91,32 +107,51 @@ def _run(run: dict) -> None:
     def inspect_account(account_id, stage_executor):
         account = db.get_account(account_id)
         if account is None:
-            record(skipped_count=1)
+            record(skipped_count=1, processed_count=1)
             return
         if str(account.get("live_check_status") or "").strip().lower() == "deactivated":
-            record(skipped_count=1, deactivated_skipped_count=1, failure=dict(
+            record(skipped_count=1, processed_count=1, deactivated_skipped_count=1, failure=dict(
                 account_id=account_id, email=account.get("email", ""), status="deactivated_skipped",
-                error="账号已标记为已废，本次巡检跳过，不执行 AT 检查、查活及查套餐。" +
+                error="账号已标记为已废，本次任务跳过，不执行 AT 检查、查活及查套餐。" +
                       (" 原因：" + str(account["live_check_error"]) if account.get("live_check_error") else ""),
             ))
             return
-        invalid = token_needs_refresh(account.get("access_token", ""))
-        record(checked_count=1, invalid_count=int(invalid))
-        if not invalid:
+        if mode == "plan":
+            try:
+                result = _check_plan(account, stage_executor)
+            except Exception as exc:
+                logger.exception("批量查套餐异常 account_id=%s", account_id)
+                result = {"ok": False, "status": "error", "error": f"{type(exc).__name__}: {str(exc)[:1500]}"}
+            ok = bool(result.get("ok"))
+            record(checked_count=1, processed_count=1,
+                   failure=None if ok else dict(account_id=account_id, email=account.get("email", ""),
+                                               status="plan_failed", error=result.get("error") or "套餐查询失败"),
+                   **{"plan_success_count" if ok else "plan_failed_count": 1})
             return
+        if mode == "inspection":
+            invalid = token_needs_refresh(account.get("access_token", ""))
+            record(checked_count=1, invalid_count=int(invalid), processed_count=int(not invalid))
+            if not invalid:
+                return
         try:
-            live_result = _check_live(account, stage_executor)
+            live_result = (_check_live(account, stage_executor, trigger="one_click_live") if mode == "live"
+                           else _check_live(account, stage_executor))
         except Exception as exc:
             logger.exception("巡检查活异常 account_id=%s", account_id)
             live_result = {"ok": False, "status": "error", "error": f"{type(exc).__name__}: {str(exc)[:1500]}"}
         live_ok = bool(live_result.get("ok"))
-        counts = {"live_success_count" if live_ok else "live_failed_count": 1}
+        counts = {"live_success_count" if live_ok else "live_failed_count": 1, "processed_count": 1}
+        if mode == "live":
+            counts["checked_count"] = 1
         if live_ok:
             plan_ok = bool((live_result.get("plan_result") or {}).get("ok"))
             counts["plan_success_count" if plan_ok else "plan_failed_count"] = 1
         failure = None if live_ok else dict(account_id=account_id, email=account.get("email", ""),
                                             status=live_result.get("status") or "failed",
                                             error=live_result.get("error") or "查活失败，未返回具体原因")
+        if mode == "live" and live_ok and not plan_ok:
+            failure = dict(account_id=account_id, email=account.get("email", ""), status="plan_failed",
+                           error=(live_result.get("plan_result") or {}).get("error") or "查活成功，自动查询套餐失败")
         record(failure=failure, **counts)
 
     def worker(stage_executor):
@@ -191,7 +226,7 @@ def _release_cancelled_inspection(future, run, lease):
 def _recover_orphaned_inspections() -> None:
     # 调用方必须持有进程锁；此时不会有执行中的巡检，可以清理异常退出遗留状态。
     db.recover_interrupted_account_inspections(
-        error="巡检执行器已退出或任务异常中断，已释放任务占用；统计保留已完成部分")
+        error="账号任务执行器已退出或任务异常中断，已释放任务占用；统计保留已完成部分")
 
 
 def list_inspections(limit: int = 50, offset: int = 0) -> dict:
@@ -206,8 +241,10 @@ def list_inspections(limit: int = 50, offset: int = 0) -> dict:
             lease.close()
 
 
-def start_inspection(workers: int = DEFAULT_WORKERS, archived: str | bool = "0") -> tuple[dict, bool]:
+def start_inspection(workers: int = DEFAULT_WORKERS, archived: str | bool = "0", mode: str = "inspection") -> tuple[dict, bool]:
     workers = validate_workers(workers)
+    if not isinstance(mode, str) or mode not in ("inspection", "plan", "live"):
+        raise ValueError("任务类型必须为 inspection（巡检）、plan（查套餐）或 live（查活刷新 AT）")
     if type(archived) is bool:
         archived = "only" if archived else "0"
     if not isinstance(archived, str) or archived not in ("0", "only", "all"):
@@ -215,11 +252,11 @@ def start_inspection(workers: int = DEFAULT_WORKERS, archived: str | bool = "0")
     lease = acquire_inspection_lease()
     if lease is None:
         active = db.list_account_inspections()["active"]
-        return active or {"status": "queued", "error": "巡检正在启动或收尾，请稍后重试"}, False
+        return active or {"status": "queued", "error": "账号任务正在启动或收尾，请稍后重试"}, False
     submitted = False
     try:
         _recover_orphaned_inspections()
-        run, created = db.create_account_inspection(workers=workers, archived=archived)
+        run, created = db.create_account_inspection(workers=workers, archived=archived, mode=mode)
         if created:
             try:
                 future = _EXECUTOR.submit(_run_with_lease, run.copy(), lease)

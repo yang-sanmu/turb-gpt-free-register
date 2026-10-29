@@ -53,6 +53,7 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(flow, "_complete_profile_page", return_value=True))
         self.stack.enter_context(patch.object(flow, "_fetch_chatgpt_session", return_value={"accessToken": "fixture-token", "user": {"id": "u"}}))
         self.stack.enter_context(patch.object(flow, "resolve_email_source", return_value="cloudflare_domain"))
+        self.stack.enter_context(patch("core.gptaccount_registration.resolve_email_source", return_value="cloudflare_domain"))
         self.release = self.stack.enter_context(patch("core.email_provider.release_email"))
 
     def run_flow(self):
@@ -84,6 +85,89 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.save.assert_called_once()
         self.driver.get.assert_any_call("about:blank")
         self.driver.quit.assert_called_once()
+
+    def test_session_timeout_saves_account_and_password_without_post_registration_tasks(self):
+        with isolated_account_storage() as db, patch.object(
+            flow, "_fetch_chatgpt_session", side_effect=RuntimeError("session 暂无 accessToken"),
+        ), patch("config.twofa.ENABLE_2FA", True), patch(
+            "config.register.AUTO_PLAN_CHECK_AFTER_REGISTER", True,
+        ), patch("core.twofa_service.enqueue_account_totp_setup") as twofa, patch(
+            "core.plan_check_service.enqueue_account_plan_check",
+        ) as plan:
+            result = self.run_flow()
+            row = db.get_account(result["account_id"])
+            self.assertFalse(result["success"])
+            self.assertIn("session 暂无 accessToken", result["error"])
+            self.assertEqual(row["email"], "fixture@example.com")
+            self.assertEqual(row["access_token"], "")
+            self.assertEqual(row["user_name"], "Fixture")
+            extra = json.loads(row["extra_json"])
+            self.assertEqual(extra["registration_password"], "fixture-password")
+            self.assertEqual(extra["registration_session_error"], "session 暂无 accessToken")
+            self.assertIn("已创建，注册时获取 Token 失败", row["note"])
+            self.assertIn("session 暂无 accessToken", row["note"])
+            twofa.assert_not_called()
+            plan.assert_not_called()
+        self.save.assert_not_called()
+        self.release.assert_not_called()
+        self.driver.quit.assert_called_once()
+
+    def test_failure_before_profile_submission_does_not_save_account(self):
+        with isolated_account_storage() as db, patch.object(
+            flow, "_complete_profile_page", side_effect=RuntimeError("profile not submitted"),
+        ):
+            result = self.run_flow()
+            self.assertIsNone(db.get_account_by_email("fixture@example.com"))
+        self.assertFalse(result["success"])
+        self.assertIsNone(result["account_id"])
+        self.save.assert_not_called()
+        self.assertEqual(self.release.call_args.kwargs["status"], "available")
+
+    def test_session_timeout_preserves_existing_account_credentials_and_note(self):
+        with isolated_account_storage() as db, patch.object(
+            flow, "_fetch_chatgpt_session", side_effect=RuntimeError("session timeout"),
+        ):
+            account_id = db.insert_account(
+                email="fixture@example.com", access_token="existing-token",
+                extra={"registration_password": "existing-password"},
+            )
+            db.update_account_note(account_id, "用户备注")
+            original = db.get_account(account_id)
+            result = self.run_flow()
+            self.assertEqual(db.get_account(account_id), original)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["account_id"], account_id)
+        self.release.assert_not_called()
+
+    def test_partial_save_failure_preserves_original_session_error(self):
+        with patch.object(
+            flow, "_fetch_chatgpt_session", side_effect=RuntimeError("original session timeout"),
+        ), patch("core.db.get_account_by_email", return_value=None), patch(
+            "core.db.insert_account", side_effect=RuntimeError("database unavailable"),
+        ), self.assertLogs(flow.logger, level="WARNING") as logs:
+            result = self.run_flow()
+        self.assertFalse(result["success"])
+        self.assertIsNone(result["account_id"])
+        self.assertIn("original session timeout", result["error"])
+        self.assertIn("database unavailable", " ".join(logs.output))
+        self.assertEqual(self.release.call_args.kwargs["status"], "failed")
+
+    def test_successful_registration_still_queues_plan_and_twofa(self):
+        from core.account_export import save_account_data
+
+        self.save.side_effect = save_account_data
+        with isolated_account_storage() as db, patch("config.twofa.ENABLE_2FA", True), patch(
+            "config.register.AUTO_PLAN_CHECK_AFTER_REGISTER", True,
+        ), patch("core.twofa_service.enqueue_account_totp_setup", return_value={"accepted": True}) as twofa, patch(
+            "core.plan_check_service.enqueue_account_plan_check", return_value={"accepted": True},
+        ) as plan:
+            result = self.run_flow()
+            self.assertTrue(result["success"], result)
+            self.assertEqual(db.get_account(result["account_id"])["access_token"], "fixture-token")
+            for enqueue in (twofa, plan):
+                enqueue.assert_called_once()
+                self.assertEqual(enqueue.call_args.kwargs["account_id"], result["account_id"])
+                self.assertEqual(enqueue.call_args.kwargs["access_token"], "fixture-token")
 
     def test_cdp_statistics_start_failure_does_not_abort_registration(self):
         from core.gptaccount_network import start_gptaccount_network
@@ -181,6 +265,19 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.driver.context.storage_state.assert_not_called()
         self.driver.quit.assert_not_called()
         self.assertIn("cloakbrowser", self.save.call_args.kwargs["extra"])
+
+    def test_cloak_session_timeout_keeps_upstream_behavior_without_saving(self):
+        with patch.object(flow, "build_cloak_driver", return_value=(self.driver, self.opened)), patch.object(
+            flow, "_fetch_chatgpt_session", side_effect=RuntimeError("session timeout"),
+        ), patch("core.db.insert_account") as insert:
+            result = flow.run_cloak_registration(
+                "fixture@example.com", "Fixture", "1995-01-01", otp_code="123456",
+            )
+        self.assertFalse(result["success"])
+        self.assertIsNone(result["account_id"])
+        self.save.assert_not_called()
+        insert.assert_not_called()
+        self.assertEqual(self.release.call_args.kwargs["status"], "failed")
 
 
 class GptAccountDriverTests(unittest.TestCase):

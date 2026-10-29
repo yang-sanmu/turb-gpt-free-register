@@ -58,6 +58,139 @@ class AccountInspectionTests(unittest.TestCase):
         lease_patch.start()
         self.addCleanup(lease_patch.stop)
 
+    def test_one_click_plan_queries_all_tokens_without_login_and_keeps_failure_details(self):
+        run, _ = db.create_account_inspection(mode='plan', workers=3)
+        def enqueue(**kwargs):
+            if not kwargs['access_token']:
+                return {'accepted': False, 'error': 'missing token'}
+            future = Future()
+            future.set_result({'ok': kwargs['account_id'] == 1, 'error': 'invalid token'})
+            return {'accepted': True, 'future': future}
+        with patch.object(plan_service, 'enqueue_account_plan_check', side_effect=enqueue) as plan, \
+             patch.object(service.live_check_service, 'enqueue_account_live_check') as live, \
+             patch.object(service, 'token_needs_refresh') as token:
+            service._run(run)
+        live.assert_not_called()
+        token.assert_not_called()
+        self.assertEqual({c.kwargs['account_id'] for c in plan.call_args_list}, {1, 2, 3, 4})
+        self.assertTrue(all(c.kwargs['return_future'] for c in plan.call_args_list))
+        self.assertEqual(run['status'], 'completed')
+        self.assertEqual(run['processed_count'], 4)
+        self.assertEqual(run['plan_success_count'], 1)
+        self.assertEqual(run['plan_failed_count'], 3)
+        self.assertEqual(run['failure_count'], 3)
+        details = db.list_account_inspection_failures(run['id'])
+        self.assertEqual(details['total'], 3)
+        self.assertEqual({r['status'] for r in details['items']}, {'plan_failed'})
+        self.assertTrue(any(r['error'] == 'missing token' for r in details['items']))
+        db.delete_account(3)
+        self.assertEqual(db.list_account_inspection_failures(run['id'])['items'], details['items'])
+
+    def test_one_click_live_refreshes_valid_at_and_separates_automatic_plan_failure(self):
+        db.update_account_liveness(4, {'status': 'deactivated', 'error': 'disabled'})
+        run, _ = db.create_account_inspection([1, 2, 3, 4, 999], mode='live', workers=3)
+        def enqueue(**kwargs):
+            return completed(kwargs['account_id'] != 2, plan_ok=False)
+        with patch.object(service.live_check_service, 'enqueue_account_live_check', side_effect=enqueue) as live, \
+             patch.object(service, 'token_needs_refresh') as token, \
+             patch.object(plan_service, 'enqueue_account_plan_check') as plan:
+            service._run(run)
+        token.assert_not_called()
+        plan.assert_not_called()
+        self.assertEqual({c.kwargs['account_id'] for c in live.call_args_list}, {1, 2, 3})
+        self.assertTrue(all(c.kwargs['trigger'] == 'one_click_live' for c in live.call_args_list))
+        self.assertEqual(run['processed_count'], 5)
+        self.assertEqual(run['skipped_count'], 2)
+        self.assertEqual(run['live_success_count'], 2)
+        self.assertEqual(run['live_failed_count'], 1)
+        self.assertEqual(run['plan_failed_count'], 2)
+        self.assertEqual(run['failure_count'], 4)
+        self.assertEqual(db.list_account_inspection_failures(run['id'])['total'], 4)
+
+    def test_one_click_progress_is_persisted_only_after_result_and_survives_readers(self):
+        for mode in ('plan', 'live'):
+            with self.subTest(mode=mode):
+                run, _ = db.create_account_inspection([1], mode=mode)
+                result = Future()
+                entered = threading.Event()
+                def enqueue(**kwargs):
+                    entered.set()
+                    return {'accepted': True, 'future': result}
+                module = plan_service if mode == 'plan' else service.live_check_service
+                method = 'enqueue_account_plan_check' if mode == 'plan' else 'enqueue_account_live_check'
+                lease = service.acquire_inspection_lease()
+                with patch.object(module, method, side_effect=enqueue), ThreadPoolExecutor(1) as pool:
+                    running = pool.submit(service._run_with_lease, run, lease)
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        progress = service.list_inspections()['active']
+                        self.assertEqual(progress['mode'], mode)
+                        self.assertEqual(progress['processed_count'], 0)
+                        self.assertEqual(progress['status'], 'running')
+                        self.assertNotIn('account_ids', progress)
+                        with service.startup_recovery_guard() as can_recover:
+                            self.assertFalse(can_recover)
+                        duplicate, created = service.start_inspection(mode=mode)
+                        self.assertFalse(created)
+                        self.assertEqual(duplicate['id'], run['id'])
+                    finally:
+                        result.set_result({'ok': True, 'plan_result': {'ok': True}})
+                        running.result(timeout=10)
+                history = service.list_inspections()
+                self.assertIsNone(history['active'])
+                self.assertEqual(history['items'][0]['processed_count'], 1)
+                self.assertEqual(history['items'][0]['status'], 'completed')
+
+    def test_one_click_plan_skips_deactivated_and_survives_queue_errors(self):
+        db.update_account_liveness(1, {'status': 'deactivated', 'error': 'disabled'})
+        run, _ = db.create_account_inspection([1, 2, 3, 999], mode='plan')
+        with patch.object(plan_service, 'enqueue_account_plan_check', side_effect=[
+            {'accepted': False, 'busy': True, 'error': 'already running'}, RuntimeError('queue error')
+        ]):
+            service._run(run)
+        self.assertEqual(run['status'], 'completed')
+        self.assertEqual(run['processed_count'], 4)
+        self.assertEqual(run['skipped_count'], 2)
+        self.assertEqual(run['plan_failed_count'], 2)
+        self.assertEqual(run['failure_count'], 3)
+
+    def test_one_click_modes_validate_before_acquiring_task(self):
+        client = create_app(auth_code='inspection-test').test_client()
+        headers = {'X-Auth-Code': 'inspection-test'}
+        with patch.object(service._EXECUTOR, 'submit') as submit:
+            for mode in ('unknown', '', [], {}, True, None, 1):
+                self.assertEqual(client.post('/api/accounts/inspections', headers=headers,
+                                             json={'mode': mode}).status_code, 400)
+            submit.assert_not_called()
+
+    def _assert_one_click_api(self, mode):
+        client = create_app(auth_code='inspection-test').test_client()
+        headers = {'X-Auth-Code': 'inspection-test'}
+        with patch.object(service._EXECUTOR, 'submit'):
+            response = client.post('/api/accounts/inspections', headers=headers,
+                                   json={'mode': mode, 'archived': 'only', 'workers': 4})
+            self.assertEqual(response.status_code, 202)
+            task = response.get_json()['task']
+            self.assertEqual(task['mode'], mode)
+            self.assertEqual(task['total_count'], 1)
+            self.assertNotIn('account_ids', task)
+            duplicate = client.post('/api/accounts/inspections', headers=headers, json={'mode': 'inspection'})
+            self.assertEqual(duplicate.status_code, 409)
+            self.assertEqual(duplicate.get_json()['task']['id'], task['id'])
+            history = client.get('/api/accounts/inspections', headers=headers).get_json()
+            self.assertEqual(history['active']['mode'], mode)
+        for ui in ('v2', 'legacy'):
+            html = client.get('/?ui=' + ui, headers=headers).get_data(as_text=True)
+            self.assertIn('id="btnCheckAllPlans"', html)
+            self.assertIn('id="btnCheckAllLive"', html)
+            self.assertIn("restoreAccountTaskProgress();", html)
+
+    def test_one_click_plan_api_and_templates(self):
+        self._assert_one_click_api('plan')
+
+    def test_one_click_live_api_and_templates(self):
+        self._assert_one_click_api('live')
+
     def test_deactivated_is_skipped_before_token_check_and_saved_in_details(self):
         db._ensure_sqlite()
         with closing(db._sqlite_conn()) as conn, conn:

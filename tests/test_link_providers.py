@@ -14,19 +14,23 @@ def _sse(*events):
 
 
 class _Resp:
-    def __init__(self, lines, status=200):
+    def __init__(self, lines=(), status=200, text=""):
         self.status_code = status
-        self.text = ""
+        self.text = text
         self._lines = lines
 
     def iter_lines(self):
         return iter(self._lines)
 
+    def json(self):
+        return json.loads(self.text)
+
 
 class NerverUpiTests(unittest.TestCase):
     def setUp(self):
         patcher = patch.multiple(cfg, NERVER_UPI_PROXY_POOL=["1.2.3.4:8080:user:pass"],
-                                 NERVER_UPI_API_BASE="https://upi.example/", NERVER_UPI_TIMEOUT=60)
+                                 NERVER_UPI_API_BASE="https://upi.example/", NERVER_UPI_TIMEOUT=60,
+                                 NERVER_UPI_MODE="stream")
         patcher.start()
         self.addCleanup(patcher.stop)
         self.db = patch.object(link_providers, "db").start()
@@ -54,6 +58,8 @@ class NerverUpiTests(unittest.TestCase):
         body = session.post.call_args.kwargs["json"]
         self.assertEqual(url, "https://upi.example/api/v1/upi/stream")
         self.assertEqual(body, {"token": "eyJ.tok.en", "proxy": "http://user:pass@1.2.3.4:8080"})
+        self.assertEqual(session.post.call_args.kwargs["headers"], {"Accept": "text/event-stream"})
+        self.assertTrue(session.post.call_args.kwargs["stream"])
         self.assertNotIn("proxies", session.post.call_args.kwargs)
         self.assertTrue(result["ok"])
         self.assertEqual(result["link_type"], "upi")
@@ -81,6 +87,75 @@ class NerverUpiTests(unittest.TestCase):
         with patch.object(cfg, "NERVER_UPI_PROXY_POOL", []):
             with self.assertRaisesRegex(ValueError, "NERVER_UPI_PROXY_POOL"):
                 link_providers.run_nerver_upi(account_id=1, access_token="t")
+
+    def test_json_success_matches_stream_result_and_sends_direct_request(self):
+        done = {"ok": True, "request_id": "req_json", "upi_redirect_url": "https://pay/x",
+                "upi_qr_data": "upi://pay?pa=x", "upi_qr_image_url": "https://qr/x.png",
+                "next_action_type": "display_upi_qr_code"}
+        stream_result, _, _ = self._run(_Resp(_sse(("done", done))))
+        with patch.object(cfg, "NERVER_UPI_MODE", "json"):
+            result, session, factory = self._run(_Resp(text=json.dumps(done)))
+        self.assertEqual(result, stream_result)
+        factory.assert_called_once_with(trust_env=False)
+        session.post.assert_called_once_with(
+            "https://upi.example/api/v1/upi",
+            json={"token": "eyJ.tok.en", "proxy": "http://user:pass@1.2.3.4:8080"},
+            headers={"Accept": "application/json"}, timeout=(15, 60), stream=False,
+        )
+        self.db.update_account_extract.assert_not_called()
+
+    def test_both_modes_accept_hosted_url_or_qr_only(self):
+        for mode in ("stream", "json"):
+            for field, value, mapped in (
+                ("upi_hosted_url", "https://pay/hosted", "long_url"),
+                ("upi_qr_data", "upi://pay?pa=x", "copy_paste"),
+                ("upi_qr_image_url", "https://qr/x.png", "image_url_png"),
+            ):
+                with self.subTest(mode=mode, field=field), patch.object(cfg, "NERVER_UPI_MODE", mode):
+                    done = {"ok": True, field: value}
+                    resp = _Resp(_sse(("done", done))) if mode == "stream" else _Resp(text=json.dumps(done))
+                    result, _, _ = self._run(resp)
+                    self.assertEqual(result["result"][mapped], value)
+
+    def test_json_business_failure_preserves_reason_message_and_error(self):
+        done = {"ok": False, "reason": "token-invalidated", "message": "token 已失效", "error": "401"}
+        with patch.object(cfg, "NERVER_UPI_MODE", "json"), \
+                self.assertRaisesRegex(RuntimeError, "token-invalidated token 已失效；401"):
+            self._run(_Resp(text=json.dumps(done)))
+
+    def test_json_success_without_link_or_qr_is_failure(self):
+        with patch.object(cfg, "NERVER_UPI_MODE", "json"), self.assertRaisesRegex(RuntimeError, "没有链接"):
+            self._run(_Resp(text=json.dumps({"ok": True, "request_id": "empty_json"})))
+
+    def test_json_http_error_preserves_status_and_body(self):
+        with patch.object(cfg, "NERVER_UPI_MODE", "json"), \
+                self.assertRaisesRegex(RuntimeError, "HTTP 503: upstream unavailable"):
+            self._run(_Resp(status=503, text="upstream unavailable"))
+
+    def test_json_malformed_or_non_object_response_is_failure(self):
+        for body, error in (("<html>bad gateway</html>", "无效 JSON"), ("", "无效 JSON"),
+                            ("null", "预期 JSON 对象"), ("[]", "预期 JSON 对象")):
+            with self.subTest(body=body), patch.object(cfg, "NERVER_UPI_MODE", "json"), \
+                    self.assertRaisesRegex(RuntimeError, error):
+                self._run(_Resp(text=body))
+
+    def test_invalid_mode_rejected_before_request(self):
+        with patch.object(cfg, "NERVER_UPI_MODE", "nope"), \
+                patch.object(link_providers.curl_requests, "Session") as factory, \
+                self.assertRaisesRegex(ValueError, "NERVER_UPI_MODE"):
+            link_providers.run_nerver_upi(account_id=7, access_token="t")
+        factory.assert_not_called()
+
+    def test_timeout_closes_session_without_retry_in_both_modes(self):
+        for mode in ("stream", "json"):
+            with self.subTest(mode=mode), patch.object(cfg, "NERVER_UPI_MODE", mode), \
+                    patch.object(link_providers.curl_requests, "Session") as factory:
+                session = factory.return_value
+                session.post.side_effect = link_providers.curl_requests.exceptions.Timeout("timeout")
+                with self.assertRaises(link_providers.curl_requests.exceptions.Timeout):
+                    link_providers.run_nerver_upi(account_id=7, access_token="t")
+                session.post.assert_called_once()
+                session.close.assert_called_once()
 
 
 class ProviderDispatchTests(unittest.TestCase):

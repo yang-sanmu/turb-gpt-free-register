@@ -44,6 +44,7 @@ def run_cloak_registration(
     provider: str = "cloakbrowser",
     capture_state=None,
     network_factory=None,
+    on_session_error=None,
 ) -> dict:
     """CloakBrowser 自动化注册入口。"""
     driver = None
@@ -150,7 +151,18 @@ def run_cloak_registration(
             create_acknowledged = True
             human_delay("post_auth")
 
-        session_info = _fetch_chatgpt_session(driver, timeout=120)
+        try:
+            session_info = _fetch_chatgpt_session(driver, timeout=120)
+        except Exception as session_exc:
+            if create_acknowledged and on_session_error is not None:
+                try:
+                    account_id = on_session_error(
+                        email=email, name=name, password=openai_password, error=session_exc,
+                        proxy=((opened.raw or {}).get("proxy_pool_target") if opened else None) or proxy or None,
+                    )
+                except Exception:
+                    log.exception("[Cloak注册] session 失败回调异常：%s", email)
+            raise
         access_token = session_info["accessToken"]
         if capture_state is not None:
             try:

@@ -42,7 +42,13 @@ from core.account_export import (
     save_account_data,
     create_batch_archive_dir,
 )
-from core.email_provider import acquire_email, wait_for_otp
+from core.email_provider import (
+    acquire_email,
+    acquire_email_from_source,
+    parse_email_sources,
+    release_email_if_unconsumed,
+    wait_for_otp,
+)
 from core.humanize import delay as human_delay
 from core.name_samples import random_display_name
 from core.profile_utils import generate_random_birthday
@@ -146,8 +152,8 @@ def prepare_registration_inputs() -> tuple[str | None, str, str]:
     name = REGISTER_NAME
     birthday = generate_random_birthday()
 
-    # 邮箱：自动模式下先留空；浏览器驱动会在页面找到邮箱输入框后领取，
-    # protocol 驱动会在 run_registration 开始认证前领取。
+    # 自动邮箱先留空，由 run_registration 决定领取时机：纯 iCloud 来源在
+    # 启动浏览器前领取，其他来源仍等邮箱输入框；protocol 在认证前领取。
     if not email:
         if not _email_cfg.USE_EMAIL_SERVICE:
             email = input("请输入注册邮箱: ").strip()
@@ -192,6 +198,43 @@ def run_registration(
         proxy: 代理地址（不传则从 PROXY_POOL 随机抽）
         otp_code: 邮箱验证码（如果为None，会等待手动输入）
     """
+    early_email = None
+    try:
+        # 纯 iCloud 来源先领取，池耗尽时无需启动浏览器；其他来源保留原时机。
+        if (
+            not str(email or "").strip()
+            and _email_cfg.USE_EMAIL_SERVICE
+            and parse_email_sources() == ["icloud"]
+        ):
+            email = early_email = acquire_email_from_source("icloud")
+            if on_email_acquired:
+                on_email_acquired(email)
+        return _run_registration(
+            email=email, name=name, birthday=birthday, proxy=proxy,
+            otp_code=otp_code, batch_dir=batch_dir,
+            on_email_acquired=on_email_acquired,
+        )
+    except Exception as exc:
+        # 部分驱动在自身 try 之前启动浏览器，统一兜底这段异常及回调取消。
+        # 仅回收仍为 used 且未保存账号的领取，保留驱动已判废的状态。
+        if early_email:
+            try:
+                release_email_if_unconsumed(early_email, note=f"注册异常: {str(exc)[:180]}")
+            except Exception:
+                logger.warning("[注册] 回收提前领取的 iCloud 邮箱失败: %s", early_email, exc_info=True)
+        raise
+
+
+def _run_registration(
+    email: str | None,
+    name: str,
+    birthday: str | None = None,
+    proxy: str = None,
+    otp_code: str = None,
+    batch_dir=None,
+    on_email_acquired: Callable[[str], None] | None = None,
+):
+    """按所选驱动执行注册；已有邮箱直接复用。"""
     # 可选注册驱动：
     #   protocol     = 原有纯协议（curl_cffi）
     #   roxy         = RoxyBrowser 指纹浏览器 + Selenium

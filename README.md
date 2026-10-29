@@ -95,6 +95,15 @@ EMAIL_SOURCE = "outlook,generic_api,imap"
 - 配置页支持热加载，保存后无需重启。
 - Roxy 团队/项目可在配置页获取并保存。
 
+### Nerver UPI 提链
+
+在 WebUI「提链」中选择 `Nerver UPI`，填写代理池，并通过「Nerver UPI 接口模式」切换：
+
+- `stream`（默认）：调用 `POST /api/v1/upi/stream`，显示实时步骤进度。
+- `json`：调用 `POST /api/v1/upi`，等待完整 JSON 结果，不显示中间步骤。
+
+也可在 `.env` 设置 `LINK_PROVIDER="nerver_upi"` 和 `NERVER_UPI_MODE="json"`。请求 Nerver 本身直连，账号 token 和随机选取的代理通过 JSON 请求体传入；两种模式共用结果字段及失败处理。`NERVER_UPI_TIMEOUT` 默认 300 秒，非流式建议至少保留 300 秒。接口格式见 [Nerver API 文档](https://cha.nerver.cc/api)。
+
 ### 数据存储
 
 - 账号、邮箱库、任务及 Codex 凭证运行时统一存储在项目根目录 `turb.sqlite3`，按业务拆分为 `accounts`、`email_pool`（邮箱库）、`registration_jobs`、`codex_accounts` 和 `codex_agent_accounts` 五张表。

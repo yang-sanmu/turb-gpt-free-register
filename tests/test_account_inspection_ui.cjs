@@ -6,7 +6,7 @@ const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const empty = {active:null, total:0, items:[]};
 const active = {active:{id:1}, total:1, items:[{id:1, archived:'only', status:'running', workers:4}]};
 async function flush() {for (let i = 0; i < 12; i++) await Promise.resolve();}
-function harness() {
+function harness(storage = new Map()) {
   const elements = new Map(), requests = [], timers = new Map(), toasts = [];
   let nextTimer = 0, accountsReloaded = 0;
   const confirmations = [], selected = new Set([1,2]);
@@ -14,12 +14,13 @@ function harness() {
     if (!elements.has(id)) elements.set(id, {
       value:'4', open:false, disabled:false, textContent:'', innerHTML:'',
       scrollTop:0, querySelector(){return null;}, closest(){return this;},
-      classList:{contains:()=>false}, showModal(){this.open=true;}, close(){this.open=false;},
+      classList:{hidden:false, contains(){return this.hidden;}}, showModal(){this.open=true;}, close(){this.open=false;},
     });
     return elements.get(id);
   }
   const context = vm.createContext({
     document:{hidden:false, getElementById:element}, SHOW_ARCHIVED_ACCOUNTS:true, AbortController,
+    localStorage:{getItem:key=>storage.get(key), setItem:(key,value)=>storage.set(key,value), removeItem:key=>storage.delete(key)},
     ACCOUNT_SELECTED:selected, confirm(message){confirmations.push(message);return true;},
     setTimeout(callback){const id=++nextTimer;timers.set(id,callback);return id;},
     clearTimeout(id){timers.delete(id);}, setInterval(){},
@@ -35,7 +36,7 @@ function harness() {
   });
   const run=source=>vm.runInContext(source,context);
   run(script);
-  return {element,requests,timers,toasts,run,confirmations,selected,get accountsReloaded(){return accountsReloaded;},
+  return {element,requests,timers,toasts,run,confirmations,selected,storage,get accountsReloaded(){return accountsReloaded;},
     async resolve(index,value){requests[index].resolve(value);await flush();},
     async reject(index,error){requests[index].reject(error);await flush();},
     async expire(){for(const callback of [...timers.values()])callback();await flush();},
@@ -48,14 +49,15 @@ function harness() {
   assert.equal(h.element('inspectionScopeLabel').textContent,'已归档');
   h.run('SHOW_ARCHIVED_ACCOUNTS=false');
   const submit=h.run('submitAccountInspection({preventDefault(){}})');
-  assert.deepEqual(JSON.parse(h.requests[1].options.body),{workers:4,archived:'only'});
+  assert.deepEqual(JSON.parse(h.requests[1].options.body),{workers:4,archived:'only',mode:'inspection'});
   await h.resolve(0,empty);
   assert.equal(h.element('btnStartInspection').disabled,true);
   h.run('refreshInspectionHistory()');
   await h.resolve(1,{ok:true}); await submit;
   assert.equal(h.run('inspectionActive'),true);
   await h.resolve(2,empty);
-  assert.equal(h.element('btnStartInspection').disabled,true);
+  assert.equal(h.element('btnStartInspection').disabled,false); // 运行中按钮用于重新打开进度。
+  assert.equal(h.run('inspectionActive'),true);
   assert.equal(h.requests.length,4); // 不丢失启动完成时的刷新请求。
   await h.resolve(3,active);
   assert.match(h.element('inspectionHistoryContent').innerHTML,/已归档/);
@@ -68,7 +70,7 @@ function harness() {
   h.run('refreshInspectionHistory()'); await h.resolve(6,empty);
   assert.equal(h.element('btnStartInspection').disabled,false);
   assert.equal(h.accountsReloaded,1);
-  assert.match(h.element('inspectionHistoryContent').innerHTML,/暂无巡检记录/);
+  assert.match(h.element('inspectionHistoryContent').innerHTML,/暂无任务记录/);
   h.run('refreshInspectionHistory()');
   await h.resolve(7,{active:null,total:1,items:[{
     id:8,archived:'only',status:'<img src=x>',workers:8,created_at:'2026-10-17T17:20:10',
@@ -77,7 +79,7 @@ function harness() {
     error:'<script>alert(1)</script>',
   }]});
   const markup=h.element('inspectionHistoryContent').innerHTML;
-  for(const pattern of [/44 \/ 40/,/跳过 2 个/,/width:100%/,/inspection-pill--unknown/,/&lt;script&gt;/])assert.match(markup,pattern);
+  for(const pattern of [/46 \/ 40/,/跳过 2 个/,/width:100%/,/inspection-pill--unknown/,/&lt;script&gt;/])assert.match(markup,pattern);
   assert.doesNotMatch(markup,/<script>|<img/);
   assert.equal(h.element('inspectionRefresh').disabled,false);
 
@@ -150,7 +152,7 @@ function harness() {
   assert.equal(details.element('inspectionFailuresRefresh').disabled,false);
   details.run('refreshInspectionFailures()');
   await details.resolve(6,{task:{archived:'0'},total:0,details_available:true,items:[]});
-  assert.match(details.element('inspectionFailuresContent').innerHTML,/暂无查活失败或已废跳过记录/);
+  assert.match(details.element('inspectionFailuresContent').innerHTML,/暂无失败或已废跳过记录/);
   assert.equal(details.timers.size,0);
 
   // 同页 DOM 不变时跳过重建；有变化保留阅读位置，翻页重置。
@@ -206,5 +208,76 @@ function harness() {
   const initial=harness();await initial.reject(0,new Error('offline'));
   assert.match(initial.element('inspectionHistoryContent').innerHTML,/暂时无法读取/);
   assert.equal(initial.element('inspectionRefresh').disabled,false);
+
+  // 两种一键模式无需勾选；仅提交模式、范围与线程，运行中点击入口只恢复进度。
+  for (const mode of ['plan','live']) {
+    const bulk=harness();await bulk.resolve(0,empty);bulk.selected.clear();
+    bulk.run(`startAccountInspection('${mode}')`);
+    assert.match(bulk.element('inspectionStartTitle').textContent,mode==='plan'?/查套餐/:/查活刷新 AT/);
+    const starting=bulk.run('submitAccountInspection({preventDefault(){}})');
+    assert.deepEqual(JSON.parse(bulk.requests[1].options.body),{workers:4,archived:'only',mode});
+    await bulk.resolve(1,{ok:true,task:{id:42,mode}});await starting;
+    const ongoing={active:{id:42,mode},total:1,items:[{id:42,mode,status:'running',total_count:10,
+      processed_count:3,checked_count:8,skipped_count:1,plan_failed_count:1,failure_count:1}]};
+    await bulk.resolve(2,ongoing);
+    assert.match(bulk.element('inspectionHistoryContent').innerHTML,/3 \/ 10 · 30%/);
+    assert.match(bulk.element('inspectionHistoryContent').innerHTML,/openInspectionFailures\(42\)/);
+    bulk.element('inspectionHistoryDialog').close();
+    bulk.run('refreshInspectionHistory()');await bulk.resolve(3,ongoing);
+    assert.equal(bulk.element('inspectionHistoryDialog').open,false); // 后台轮询不反复弹出。
+    bulk.run(`startAccountInspection('${mode}')`);
+    assert.equal(bulk.element('inspectionHistoryDialog').open,true);
+    assert.equal(bulk.requests.filter(r=>r.options?.method==='POST').length,1);
+    await bulk.resolve(4,ongoing);
+    bulk.element('inspectionHistoryDialog').close();
+    bulk.element('tab-accounts').classList.hidden=true;
+    bulk.run('refreshInspectionHistory()');await bulk.resolve(5,ongoing);
+    assert.equal(bulk.element('inspectionHistoryDialog').open,false);
+    bulk.element('tab-accounts').classList.hidden=false;
+    bulk.run('restoreAccountTaskProgress()');await bulk.resolve(6,ongoing);
+    assert.equal(bulk.element('inspectionHistoryDialog').open,true);
+
+    // 整页重新加载后由服务端恢复；关闭时完成的任务也能恢复查看一次结果。
+    const reload=harness(bulk.storage);await reload.resolve(0,ongoing);
+    assert.equal(reload.element('inspectionHistoryDialog').open,true);
+    reload.element('inspectionHistoryDialog').close();
+    const done={active:null,total:1,items:[{...ongoing.items[0],status:'completed',processed_count:10}]};
+    reload.run('refreshInspectionHistory()');await reload.resolve(1,done);
+    assert.equal(reload.element('inspectionHistoryDialog').open,false);
+    const finished=harness(reload.storage);await finished.resolve(0,done);
+    assert.equal(finished.element('inspectionHistoryDialog').open,true);
+    assert.equal(finished.run('inspectionResume'),false);
+    assert.match(finished.element('inspectionHistoryContent').innerHTML,/10 \/ 10 · 100%/);
+    finished.element('inspectionHistoryDialog').close();
+    finished.run('refreshInspectionHistory()');await finished.resolve(1,done);
+    assert.equal(finished.element('inspectionHistoryDialog').open,false);
+  }
+
+  const background=harness();background.element('tab-accounts').classList.hidden=true;
+  await background.resolve(0,active);
+  assert.equal(background.element('inspectionHistoryDialog').open,false);
+  background.element('tab-accounts').classList.hidden=false;
+  background.run('restoreAccountTaskProgress()');await background.resolve(1,active);
+  assert.equal(background.element('inspectionHistoryDialog').open,true);
+
+  // 返回页面时仍在途的旧 GET 不能消耗恢复请求，必须等待新的快照。
+  const returning=harness();returning.element('tab-accounts').classList.hidden=true;
+  returning.element('tab-accounts').classList.hidden=false;
+  returning.run('restoreAccountTaskProgress()');
+  await returning.resolve(0,empty);
+  assert.equal(returning.run('inspectionRestoreRequested'),true);
+  await returning.resolve(1,active);
+  assert.equal(returning.element('inspectionHistoryDialog').open,true);
+
+  // 曾翻到旧历史页后启动失败，恢复进度必须读取第一页，才能显示当前任务。
+  const recovery=harness();await recovery.resolve(0,empty);
+  recovery.run("inspectionPage=2;startAccountInspection('plan')");
+  const recovering=recovery.run('submitAccountInspection({preventDefault(){}})');
+  await recovery.reject(1,new Error('connection lost'));await recovering;
+  assert.equal(recovery.requests[2].url,'/api/accounts/inspections?page=1');
+  await recovery.resolve(2,active);
+  assert.equal(recovery.element('inspectionHistoryDialog').open,true);
+  assert.equal(recovery.element('inspectionStartDialog').open,false);
+  assert.match(recovery.element('inspectionHistoryContent').innerHTML,/#1/);
   console.log('巡检 UI 验收通过：范围、旧响应隔离、GET/POST 超时、未知启动结果防重、分页补读、统计与转义。');
 })().catch(error=>{console.error(error);process.exitCode=1;});

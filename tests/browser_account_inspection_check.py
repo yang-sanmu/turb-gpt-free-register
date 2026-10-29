@@ -36,10 +36,11 @@ with sync_playwright() as p:
         layout.set_content(f'<html><head><style>{css} body {{padding-left:0;}}</style></head><body><main><section class="accounts-panel-v2 card"><div class="accounts-toolbar">{toolbar}</div></section></main></body></html>')
         for width in (320,390,768,1328):
             layout.set_viewport_size({'width':width,'height':844})
-            button=layout.locator('#btnDeleteDeactivatedAccounts')
-            button.scroll_into_view_if_needed()
-            box=button.bounding_box()
-            assert box and box['width']>0 and box['x']>=0 and box['x']+box['width']<=width, (template,width,box)
+            for button_id in ('btnDeleteDeactivatedAccounts', 'btnCheckAllPlans', 'btnCheckAllLive'):
+                button=layout.locator('#'+button_id)
+                button.scroll_into_view_if_needed()
+                box=button.bounding_box()
+                assert box and box['width']>0 and box['x']>=0 and box['x']+box['width']<=width, (template,width,button_id,box)
         layout.screenshot(path=str(output/f'deactivated-toolbar-{template}.png'))
         layout.close()
         page=browser.new_page(viewport={'width':1328,'height':800},device_scale_factor=1)
@@ -117,9 +118,46 @@ with sync_playwright() as p:
         assert page.locator('#inspectionScopeLabel').inner_text()=='已归档'
         page.keyboard.press('Escape')
         page.evaluate('openInspectionHistory()')
-        page.get_by_text('暂无巡检记录',exact=True).wait_for()
+        page.get_by_text('暂无任务记录',exact=True).wait_for()
         page.set_viewport_size({'width':1328,'height':800})
         page.screenshot(path=str(output/f'inspection-empty-{template}.png'))
+        # 一键模式的实际表单提交、进度统计、关闭与返回，均使用 mock API。
+        page.keyboard.press('Escape')
+        for mode,title in (('plan','查套餐'), ('live','查活刷新 AT')):
+            page.evaluate("""async mode => {
+              fixtureItems=[];
+              api=async(url,options)=>{
+                if(options?.method==='POST') {
+                  const request=JSON.parse(options.body);
+                  if(request.mode!==mode || request.archived!=='only')throw Error('wrong scope/mode');
+                  fixtureItems=[{id:200,mode,status:'running',archived:'only',workers:3,total_count:20,
+                    processed_count:6,checked_count:10,skipped_count:1,plan_success_count:4,
+                    plan_failed_count:1,live_success_count:4,live_failed_count:1,failure_count:1}];
+                  return {ok:true,task:fixtureItems[0]};
+                }
+                return {active:fixtureItems[0]||null,total:fixtureItems.length,items:fixtureItems};
+              };
+              await refreshInspectionHistory();
+              startAccountInspection(mode);
+            }""", mode)
+            page.set_viewport_size({'width':390,'height':844})
+            assert page.locator('#inspectionStartTitle').inner_text()=='启动'+title
+            page.screenshot(path=str(output/f'one-click-{mode}-start-{template}.png'))
+            page.locator('#btnConfirmInspection').click()
+            page.wait_for_function("!inspectionLoading && document.getElementById('inspectionHistoryContent').textContent.includes('6 / 20')")
+            assert page.locator('#inspectionHistoryContent [role=progressbar]').get_attribute('aria-valuenow')=='30'
+            assert title in page.locator('#inspectionHistoryContent').inner_text()
+            page.screenshot(path=str(output/f'one-click-{mode}-progress-mobile-{template}.png'))
+            page.keyboard.press('Escape')
+            page.evaluate('refreshInspectionHistory()')
+            page.wait_for_function('!inspectionLoading')
+            assert not page.locator('#inspectionHistoryDialog').evaluate('(el)=>el.open')
+            page.evaluate('restoreAccountTaskProgress()')
+            page.wait_for_function('!inspectionLoading')
+            assert page.locator('#inspectionHistoryDialog').evaluate('(el)=>el.open')
+            page.set_viewport_size({'width':1328,'height':800})
+            page.screenshot(path=str(output/f'one-click-{mode}-progress-{template}.png'))
+            page.keyboard.press('Escape')
         # 接口字段作为文本，未知状态和错误信息不能注入 HTML。
         page.evaluate('fixtureItems=[{id:1,status:"<img src=x onerror=alert(1)>",error:"<script>alert(1)</scr"+"ipt>",total_count:0}]; refreshInspectionHistory()')
         assert page.locator('#inspectionHistoryContent img, #inspectionHistoryContent script').count()==0

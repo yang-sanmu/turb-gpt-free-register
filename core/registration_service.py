@@ -115,9 +115,8 @@ def _prepare_registration_args() -> tuple[str | None, str, str]:
 
     birthday = generate_random_birthday()
 
-    # 自动邮箱不在准备阶段领取：浏览器驱动会等页面找到邮箱输入框后再领取，
-    # 协议驱动则在 run_registration 即将开始认证时领取。这样页面打不开/找不到
-    # 输入框时不会提前消耗邮箱订单或池中素材。
+    # 自动邮箱由 run_registration 决定领取时机：纯 iCloud 来源在启动浏览器
+    # 前领取，其他来源仍等邮箱输入框，避免提前消耗订单；协议驱动在认证前领取。
     if not email and not _e.USE_EMAIL_SERVICE:
         raise RuntimeError(
             "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
@@ -304,7 +303,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 email = str(acquired_email or "").strip() or None
                 if email:
                     db.update_job(job_id, email=email)
-                    log_logger.info(f"[Job {job_id}] 页面已找到邮箱输入框，已分配邮箱: {email}")
+                    log_logger.info(f"[Job {job_id}] 已分配邮箱: {email}")
 
             result = run_registration(
                 email=email,

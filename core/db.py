@@ -3718,7 +3718,7 @@ def _inspection_payload(run):
     return json.dumps({k: v for k, v in run.items() if k != "account_ids"}, ensure_ascii=False)
 
 
-def create_account_inspection(account_ids: list[int] | None = None, workers: int = 3, archived: str = "0") -> tuple[dict, bool]:
+def create_account_inspection(account_ids: list[int] | None = None, workers: int = 3, archived: str = "0", mode: str = "inspection") -> tuple[dict, bool]:
     if account_ids is not None:
         account_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids))
     with closing(_inspection_conn()) as conn, conn:
@@ -3738,8 +3738,9 @@ def create_account_inspection(account_ids: list[int] | None = None, workers: int
                 sql += " WHERE archived=?"
                 params = (int(archived == "only"),)
             account_ids = [row[0] for row in conn.execute(sql + " ORDER BY id DESC", params)]
-        run = dict(status="queued", workers=workers, archived=archived, created_at=_now(), finished_at=None,
+        run = dict(status="queued", mode=mode, workers=workers, archived=archived, created_at=_now(), finished_at=None,
                    total_count=len(account_ids), checked_count=0, skipped_count=0, deactivated_skipped_count=0, invalid_count=0,
+                   processed_count=0, failure_count=0,
                    live_success_count=0, live_failed_count=0,
                    plan_success_count=0, plan_failed_count=0, error="",
                    failure_details_available=True, account_ids=account_ids)
@@ -3799,7 +3800,7 @@ def list_account_inspections(limit: int = 50, offset: int = 0) -> dict:
                 active=public(active[0]) if active else None)
 
 
-def recover_interrupted_account_inspections(error: str = "WebUI 重启，巡检已中断；统计保留已完成部分") -> int:
+def recover_interrupted_account_inspections(error: str = "WebUI 重启，账号任务已中断；统计保留已完成部分") -> int:
     with closing(_inspection_conn()) as conn, conn:
         # 没有待恢复任务时是纯读操作，不能为每次空闲轮询竞争 SQLite 写锁。
         if not conn.execute("SELECT 1 FROM account_inspections WHERE status IN ('queued','running') LIMIT 1").fetchone():

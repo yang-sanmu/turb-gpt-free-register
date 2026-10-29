@@ -2286,7 +2286,9 @@
         <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">套餐/提链</span>
 <button type="button" class="jobs-tb-btn" id="btnStartInspection" onclick="startAccountInspection()" title="按当前归档筛选巡检账号：本地解析 AT，失效后自动查活及查套餐">一键巡检</button>
-<button type="button" class="jobs-tb-btn" onclick="openInspectionHistory()">巡检历史</button>
+<button type="button" class="jobs-tb-btn" id="btnCheckAllPlans" onclick="startAccountInspection('plan')" title="无需勾选，查询当前归档范围内全部账号的套餐">一键查套餐</button>
+<button type="button" class="jobs-tb-btn" id="btnCheckAllLive" onclick="startAccountInspection('live')" title="无需勾选，查活当前归档范围内全部账号并刷新 AT">一键查活刷新 AT</button>
+<button type="button" class="jobs-tb-btn" onclick="openInspectionHistory()">任务进度 / 历史</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="给选中的 free(可Plus试用) 账号批量提链，类型按配置 PIX/UPI/KAKAO_PAY/IDEAL">提链</button>
@@ -2870,6 +2872,7 @@ function activateTab(tab, persist=true) {
   allowed.forEach(t => $('#tab-'+t).classList.toggle('hidden', t !== tab));
   if (persist) localStorage.setItem('gpt_console_active_tab', tab);
   if (tab === 'accounts') loadAccounts();
+  if (tab === 'accounts' && typeof restoreAccountTaskProgress === 'function') restoreAccountTaskProgress();
   if (tab === 'codex') loadCodex();
   if (tab === 'outlook') loadOutlook();
   if (tab === 'config') loadConfig();

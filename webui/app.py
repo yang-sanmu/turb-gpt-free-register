@@ -864,11 +864,12 @@ def create_app(auth_code: str | None = None) -> Flask:
         try:
             run, created = account_inspection_service.start_inspection(
                 workers=(data or {}).get("workers", account_inspection_service.DEFAULT_WORKERS),
-                archived=(data or {}).get("archived", "0"))
+                archived=(data or {}).get("archived", "0"),
+                mode=(data or {}).get("mode", "inspection"))
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify({"ok": created, "task": run,
-                        "error": "" if created else "有未完成的巡检任务，请等待完成"}), 202 if created else 409
+                        "error": "" if created else "有未完成的账号任务，请查看进度并等待完成"}), 202 if created else 409
 
     @app.post("/api/accounts/check-live-bulk")
     def api_accounts_check_live_bulk():
