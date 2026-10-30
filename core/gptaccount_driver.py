@@ -15,6 +15,9 @@ from core.cloakbrowser_driver import CloakElement, CloakOpenResult, CloakSeleniu
 
 logger = logging.getLogger(__name__)
 
+# Registration workers share startup capacity, not the lifetime of each browser.
+_GPTACCOUNT_START_LOCK = threading.Lock()
+
 
 class GptAccountBridge:
     def __init__(self):
@@ -208,6 +211,21 @@ class GptAccountDriver(CloakSeleniumDriver):
 
 
 def build_gptaccount_driver(proxy=None):
+    from core.registration_service import check_stop_requested
+
+    check_stop_requested()
+    if not _GPTACCOUNT_START_LOCK.acquire(blocking=False):
+        logger.info("[GptAccount] 等待其他浏览器完成启动初始化")
+        while not _GPTACCOUNT_START_LOCK.acquire(timeout=0.25):
+            check_stop_requested()
+    try:
+        check_stop_requested()
+        return _build_gptaccount_driver(proxy)
+    finally:
+        _GPTACCOUNT_START_LOCK.release()
+
+
+def _build_gptaccount_driver(proxy=None):
     from config.proxy import pick_proxy, normalize_proxy_url
     from core.proxy_chain import open_proxy_pool_proxy
     from playwright.sync_api import sync_playwright

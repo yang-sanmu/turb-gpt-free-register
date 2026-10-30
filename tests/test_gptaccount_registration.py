@@ -1,6 +1,9 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -281,6 +284,82 @@ class GptAccountRegistrationTests(unittest.TestCase):
 
 
 class GptAccountDriverTests(unittest.TestCase):
+    def test_startup_is_serial_but_ready_browsers_can_continue_concurrently(self):
+        start_together = threading.Barrier(3)
+        after_startup = threading.Barrier(3)
+        state_lock = threading.Lock()
+        active = peak = 0
+
+        def initialize(proxy):
+            nonlocal active, peak
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.03)  # Give other workers time to contend during startup.
+            with state_lock:
+                active -= 1
+            return proxy
+
+        def worker(index):
+            start_together.wait(timeout=5)
+            result = driver_module.build_gptaccount_driver(str(index))
+            # All browsers must return from initialization before any is closed.
+            after_startup.wait(timeout=5)
+            return result
+
+        with patch.object(driver_module, "_build_gptaccount_driver", side_effect=initialize):
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                results = list(pool.map(worker, range(3)))
+        self.assertEqual(results, ["0", "1", "2"])
+        self.assertEqual(peak, 1)
+
+    def test_waiting_worker_can_cancel_without_releasing_another_workers_lock(self):
+        from core.registration_service import StopRequested
+
+        owner_started = threading.Event()
+        release_owner = threading.Event()
+        waiter_checked = threading.Event()
+        cancel_waiter = threading.Event()
+        owner_done = threading.Event()
+
+        def initialize(proxy):
+            self.assertEqual(proxy, "owner")
+            owner_started.set()
+            self.assertTrue(release_owner.wait(timeout=5))
+            return proxy
+
+        def owner():
+            try:
+                return driver_module.build_gptaccount_driver("owner")
+            finally:
+                owner_done.set()
+
+        def waiter():
+            def check_stop():
+                waiter_checked.set()
+                if cancel_waiter.is_set():
+                    raise StopRequested("cancelled while waiting")
+            with patch("core.registration_service.check_stop_requested", side_effect=check_stop):
+                return driver_module.build_gptaccount_driver("waiter")
+
+        with patch.object(driver_module, "_build_gptaccount_driver", side_effect=initialize) as build:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                owning = pool.submit(owner)
+                try:
+                    self.assertTrue(owner_started.wait(timeout=5))
+                    waiting = pool.submit(waiter)
+                    self.assertTrue(waiter_checked.wait(timeout=5))
+                    cancel_waiter.set()
+                    with self.assertRaisesRegex(StopRequested, "cancelled while waiting"):
+                        waiting.result(timeout=3)
+                    self.assertFalse(owner_done.is_set())
+                    self.assertTrue(driver_module._GPTACCOUNT_START_LOCK.locked())
+                    build.assert_called_once_with("owner")
+                finally:
+                    release_owner.set()
+                self.assertEqual(owning.result(timeout=5), "owner")
+        self.assertFalse(driver_module._GPTACCOUNT_START_LOCK.locked())
+
     def test_startup_error_is_preserved_when_cleanup_also_fails(self):
         bridge = Mock()
         bridge.open.side_effect = RuntimeError("Chrome not found")
@@ -290,6 +369,7 @@ class GptAccountDriverTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Chrome not found"):
                     driver_module.build_gptaccount_driver("")
         self.assertIn("cleanup not confirmed", " ".join(logs.output))
+        self.assertFalse(driver_module._GPTACCOUNT_START_LOCK.locked())
 
     def test_attach_failure_closes_bridge_playwright_and_proxy_relay(self):
         bridge, relay, playwright = Mock(), Mock(), Mock()
@@ -302,6 +382,7 @@ class GptAccountDriverTests(unittest.TestCase):
         bridge.close.assert_called_once()
         playwright.stop.assert_called_once()
         relay.close.assert_called_once()
+        self.assertFalse(driver_module._GPTACCOUNT_START_LOCK.locked())
 
     def test_quit_is_idempotent_and_releases_relay_even_on_cleanup_error(self):
         bridge, relay, playwright = Mock(), Mock(), Mock()
