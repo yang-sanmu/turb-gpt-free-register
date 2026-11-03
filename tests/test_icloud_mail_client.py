@@ -286,5 +286,29 @@ class ProviderDispatchTests(unittest.TestCase):
         fetch.assert_called_once()
 
 
+class OtpWaitTests(unittest.TestCase):
+    """iCloud forwarding lags 1.5-2.5 min; the default wait must cover it."""
+
+    def _waited(self, *, otp_max_wait, icloud_wait, max_wait=None):
+        clock = {"now": 1000.0}
+        with patch.object(client.time, "time", side_effect=lambda: clock["now"]), \
+                patch.object(client.time, "sleep", side_effect=lambda s: clock.update(now=clock["now"] + s)), \
+                patch.object(client, "_connect_imap", side_effect=OSError("offline")), \
+                patch("config.email.OTP_MAX_WAIT", otp_max_wait), \
+                patch("config.email.OTP_POLL_INTERVAL", 10), \
+                patch.object(cfg, "ICLOUD_OTP_MAX_WAIT", icloud_wait, create=True), \
+                self.assertLogs(client.logger, level="INFO"):
+            with self.assertRaisesRegex(client.ICloudMailError, r"超时（(\d+)s）") as ctx:
+                client.fetch_latest_otp("x+abc@icloud.com", after_ts=1.0, max_wait=max_wait)
+        return int(ctx.exception.args[0].split("（")[1].split("s")[0])
+
+    def test_default_wait_uses_the_longer_icloud_setting(self):
+        self.assertEqual(self._waited(otp_max_wait=90, icloud_wait=180), 180)
+        self.assertEqual(self._waited(otp_max_wait=300, icloud_wait=180), 300)
+
+    def test_explicit_max_wait_is_respected(self):
+        self.assertEqual(self._waited(otp_max_wait=90, icloud_wait=180, max_wait=20), 20)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -518,6 +518,20 @@ def _login_via_email_otp(
     return _follow_continue_and_fetch(session, continue_url, referer="https://auth.openai.com/email-verification")
 
 
+# 密码这一步被拒、但邮箱 OTP 仍可登录的错误码。
+_PASSWORD_STEP_FALLBACK_CODES = ("invalid_auth_step", "password_reset_required")
+
+
+def _login_via_requested_email_otp(
+    session: BrowserSession,
+    email: str,
+    email_source: str | None = None,
+) -> dict:
+    """authorize 落到 email-verification 时服务端不会自动发码，先主动请求再等。"""
+    send_email_otp(session)
+    return _login_via_email_otp(session, email, time.time(), email_source=email_source)
+
+
 def _login_via_password_or_otp(
     session: BrowserSession,
     email: str,
@@ -528,15 +542,17 @@ def _login_via_password_or_otp(
     password = _account_registration_password(email)
     if not password:
         logger.info("[查活] 未找到注册密码，继续使用邮箱 OTP：%s", email)
-        return _login_via_email_otp(
-            session,
-            email,
-            otp_after_ts,
-            email_source=email_source,
-        )
+        return _login_via_requested_email_otp(session, email, email_source=email_source)
 
     logger.info("[查活] 账号存在密码，优先走密码登录：%s", email)
-    password_result = _password_verify(session, password)
+    try:
+        password_result = _password_verify(session, password)
+    except Exception as exc:
+        error_text = _exception_response_text(exc)
+        if not any(code in error_text for code in _PASSWORD_STEP_FALLBACK_CODES):
+            raise
+        logger.info("[查活] 密码登录被拒（%s），改用邮箱 OTP：%s", _exception_status_code(exc), email)
+        return _login_via_requested_email_otp(session, email, email_source=email_source)
     continue_url = _extract_continue_url(password_result)
     page = password_result.get("page") if isinstance(password_result, dict) else {}
     page = page if isinstance(page, dict) else {}

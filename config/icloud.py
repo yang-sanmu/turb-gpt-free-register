@@ -13,8 +13,13 @@ ICLOUD_MODE = "plus"
 # plus / plus_once 模式下新后缀长度（小写字母 + 数字），不影响已生成的固定后缀。
 ICLOUD_PLUS_LENGTH = 7
 
+# iCloud 转发到 QQ 邮箱通常要 1.5～2.5 分钟；调用方未指定等待时间时，
+# 取 OTP_MAX_WAIT 与本值中较大者。
+ICLOUD_OTP_MAX_WAIT = 180
+
 apply_env_overrides(globals(), {
     "ICLOUD_EMAILS": "list_str_multiline",
     "ICLOUD_MODE": "str",
     "ICLOUD_PLUS_LENGTH": "int",
+    "ICLOUD_OTP_MAX_WAIT": "int",
 })

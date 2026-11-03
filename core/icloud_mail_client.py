@@ -218,7 +218,9 @@ def fetch_latest_otp(
     settle_seconds: int | None = None,
 ) -> str:
     after_ts = float(after_ts or time.time())
-    max_wait = int(max_wait if max_wait is not None else _email_cfg.OTP_MAX_WAIT)
+    if max_wait is None:
+        max_wait = max(int(_email_cfg.OTP_MAX_WAIT), int(getattr(cfg, "ICLOUD_OTP_MAX_WAIT", 0) or 0))
+    max_wait = int(max_wait)
     interval = max(1, int(poll_interval if poll_interval is not None else _email_cfg.OTP_POLL_INTERVAL))
     settle = int(settle_seconds if settle_seconds is not None else _email_cfg.OTP_SETTLE_SECONDS)
     after_dt = datetime.fromtimestamp(after_ts - 30, tz=timezone.utc)

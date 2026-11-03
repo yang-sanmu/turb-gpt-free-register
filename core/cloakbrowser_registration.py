@@ -154,15 +154,20 @@ def run_cloak_registration(
         try:
             session_info = _fetch_chatgpt_session(driver, timeout=120)
         except Exception as session_exc:
+            recovered = {}
             if create_acknowledged and on_session_error is not None:
                 try:
-                    account_id = on_session_error(
-                        email=email, name=name, password=openai_password, error=session_exc,
+                    recovered = on_session_error(
+                        driver=driver, email=email, name=name, birthday=birthday, password=openai_password,
+                        error=session_exc,
                         proxy=((opened.raw or {}).get("proxy_pool_target") if opened else None) or proxy or None,
-                    )
+                    ) or {}
+                    account_id = recovered.get("account_id")
                 except Exception:
                     log.exception("[Cloak注册] session 失败回调异常：%s", email)
-            raise
+            session_info = recovered.get("session_info")
+            if not session_info:
+                raise
         access_token = session_info["accessToken"]
         if capture_state is not None:
             try:

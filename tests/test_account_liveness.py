@@ -64,6 +64,59 @@ class _DummyQueueSlot:
         self.released = True
 
 
+class _HTTPErrorWithBody(Exception):
+    def __init__(self, status, body):
+        super().__init__(f"HTTP Error {status}: ")
+        self.response = SimpleNamespace(status_code=status, text=body)
+
+
+class PasswordOrOtpLoginTests(unittest.TestCase):
+    def setUp(self):
+        self.session = object()
+        self.calls = []
+        patches = [
+            patch.object(liveness, "send_email_otp", side_effect=lambda s: self.calls.append("send")),
+            patch.object(liveness, "_login_via_email_otp",
+                         side_effect=lambda *a, **k: self.calls.append("otp") or {"accessToken": "t"}),
+            patch.object(liveness, "_follow_continue_and_fetch", return_value={"accessToken": "cb"}),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_without_password_requests_code_before_waiting(self):
+        with patch.object(liveness, "_account_registration_password", return_value=""):
+            info = liveness._login_via_password_or_otp(self.session, "a@example.com", 1.0)
+        self.assertEqual(info["accessToken"], "t")
+        self.assertEqual(self.calls, ["send", "otp"])
+
+    def test_rejected_password_step_falls_back_to_requested_code(self):
+        for code, status in (("invalid_auth_step", 400), ("password_reset_required", 401)):
+            with self.subTest(code=code):
+                self.calls.clear()
+                error = _HTTPErrorWithBody(status, '{"error": {"code": "%s"}}' % code)
+                with patch.object(liveness, "_account_registration_password", return_value="pw"), \
+                        patch.object(liveness, "_password_verify", side_effect=error):
+                    liveness._login_via_password_or_otp(self.session, "a@example.com", 1.0)
+                self.assertEqual(self.calls, ["send", "otp"])
+
+    def test_other_password_errors_still_raise(self):
+        error = _HTTPErrorWithBody(400, '{"error": {"code": "invalid_password"}}')
+        with patch.object(liveness, "_account_registration_password", return_value="pw"), \
+                patch.object(liveness, "_password_verify", side_effect=error):
+            with self.assertRaises(_HTTPErrorWithBody):
+                liveness._login_via_password_or_otp(self.session, "a@example.com", 1.0)
+        self.assertEqual(self.calls, [])
+
+    def test_password_accepted_otp_page_does_not_request_a_second_code(self):
+        result = {"page": {"type": "email_otp_verification"},
+                  "continue_url": "https://auth.openai.com/email-verification"}
+        with patch.object(liveness, "_account_registration_password", return_value="pw"), \
+                patch.object(liveness, "_password_verify", return_value=result):
+            liveness._login_via_password_or_otp(self.session, "a@example.com", 1.0)
+        self.assertEqual(self.calls, ["otp"])
+
+
 class AccountLivenessTests(unittest.TestCase):
     def setUp(self):
         plan_patch = patch("core.chatgpt_plan.check_account_plan", return_value={"ok": True, "current_plan_type": "plus"})

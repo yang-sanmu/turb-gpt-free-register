@@ -455,6 +455,8 @@ EDITABLE_FIELDS = [
      "choices": [{"value": "plus", "label": "循环 + 随机后缀"}, {"value": "direct", "label": "每个邮箱用一次"}, {"value": "plus_once", "label": "每个邮箱用一次 + 固定随机后缀"}]},
     {"key": "ICLOUD_PLUS_LENGTH", "file": "icloud.py", "type": "int", "group": "邮箱 / OTP",
      "label": "iCloud 后缀长度", "help": "plus / plus_once 新后缀位数，默认 7；已生成的固定后缀不变"},
+    {"key": "ICLOUD_OTP_MAX_WAIT", "file": "icloud.py", "type": "int", "group": "邮箱 / OTP",
+     "label": "iCloud 验证码最长等待(秒)", "help": "iCloud 转发到 QQ 通常要 1.5～2.5 分钟；实际等待取它与 OTP_MAX_WAIT 中较大者，默认 180"},
     {
         "key": "QQ_EMAIL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "QQ 邮箱地址", "help": "仅 cloudflare_domain：接收 Email Routing 转发的 QQ 邮箱，如 123456@qq.com",

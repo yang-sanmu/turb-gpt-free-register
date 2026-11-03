@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from core import cloakbrowser_registration as flow
 from core import gptaccount_driver as driver_module
+from core import registration_token_recovery as recovery
 from core.gptaccount_registration import capture_browser_state, run_gptaccount_registration
 
 
@@ -56,8 +57,13 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(flow, "_complete_profile_page", return_value=True))
         self.stack.enter_context(patch.object(flow, "_fetch_chatgpt_session", return_value={"accessToken": "fixture-token", "user": {"id": "u"}}))
         self.stack.enter_context(patch.object(flow, "resolve_email_source", return_value="cloudflare_domain"))
-        self.stack.enter_context(patch("core.gptaccount_registration.resolve_email_source", return_value="cloudflare_domain"))
+        self.stack.enter_context(patch.object(recovery, "resolve_email_source", return_value="cloudflare_domain"))
         self.release = self.stack.enter_context(patch("core.email_provider.release_email"))
+        # Recovery steps default to "could not decide"; individual tests override them.
+        self.resubmit = self.stack.enter_context(patch.object(recovery, "_session_via_profile_resubmit", return_value=None))
+        self.relogin = self.stack.enter_context(patch.object(
+            recovery, "_session_via_protocol_login", side_effect=RuntimeError("connection reset by proxy"),
+        ))
 
     def run_flow(self):
         return run_gptaccount_registration(email="fixture@example.com", name="Fixture", birthday="1995-01-01", otp_code="123456")
@@ -89,7 +95,7 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.driver.get.assert_any_call("about:blank")
         self.driver.quit.assert_called_once()
 
-    def test_session_timeout_saves_account_and_password_without_post_registration_tasks(self):
+    def test_session_timeout_saves_pending_account_when_state_is_unknown(self):
         with isolated_account_storage() as db, patch.object(
             flow, "_fetch_chatgpt_session", side_effect=RuntimeError("session 暂无 accessToken"),
         ), patch("config.twofa.ENABLE_2FA", True), patch(
@@ -107,13 +113,64 @@ class GptAccountRegistrationTests(unittest.TestCase):
             extra = json.loads(row["extra_json"])
             self.assertEqual(extra["registration_password"], "fixture-password")
             self.assertEqual(extra["registration_session_error"], "session 暂无 accessToken")
-            self.assertIn("已创建，注册时获取 Token 失败", row["note"])
-            self.assertIn("session 暂无 accessToken", row["note"])
+            self.assertIn("待查活补取", row["note"])
             twofa.assert_not_called()
             plan.assert_not_called()
+        self.relogin.assert_called_once_with("fixture@example.com", "fixture-password")
         self.save.assert_not_called()
         self.release.assert_not_called()
         self.driver.quit.assert_called_once()
+
+    def test_accepted_create_account_follows_continue_url_and_saves_token(self):
+        def fetch(driver, timeout=120):
+            if not driver.get.call_args_list or "callback" not in str(driver.get.call_args_list[-1]):
+                raise RuntimeError("session 暂无 accessToken")
+            return {"accessToken": "recovered-token", "user": {"id": "u"}}
+
+        def network(driver, *, label):
+            driver.create_account_responses.append(
+                {"status": 200, "continue_url": "https://chatgpt.com/api/auth/callback/openai?code=x", "error_code": ""})
+            return None, self.saver.return_value
+
+        self.network.side_effect = network
+        with patch.object(flow, "_fetch_chatgpt_session", side_effect=fetch),                 patch.object(recovery, "_fetch_chatgpt_session", side_effect=fetch, create=True),                 patch("core.roxy_registration._fetch_chatgpt_session", side_effect=fetch):
+            result = self.run_flow()
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.save.call_args.kwargs["access_token"], "recovered-token")
+        self.driver.get.assert_any_call("https://chatgpt.com/api/auth/callback/openai?code=x")
+        self.resubmit.assert_not_called()
+        self.relogin.assert_not_called()
+        self.release.assert_not_called()
+
+    def test_profile_resubmit_recovers_token(self):
+        self.resubmit.return_value = {"accessToken": "resubmit-token", "user": {"id": "u"}}
+        with patch.object(flow, "_fetch_chatgpt_session", side_effect=RuntimeError("session timeout")):
+            result = self.run_flow()
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.save.call_args.kwargs["access_token"], "resubmit-token")
+        self.resubmit.assert_called_once_with(self.driver, "Fixture", "1995-01-01")
+        self.relogin.assert_not_called()
+
+    def test_protocol_relogin_recovers_completed_account(self):
+        self.relogin.side_effect = None
+        self.relogin.return_value = {"accessToken": "relogin-token", "user": {"id": "u"}}
+        with patch.object(flow, "_fetch_chatgpt_session", side_effect=RuntimeError("session timeout")):
+            result = self.run_flow()
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.save.call_args.kwargs["access_token"], "relogin-token")
+        self.release.assert_not_called()
+
+    def test_burned_sub_address_is_marked_failed_without_saving(self):
+        self.relogin.side_effect = recovery.SubAddressBurned("重新登录后仍进入资料页")
+        with isolated_account_storage() as db, patch.object(
+            flow, "_fetch_chatgpt_session", side_effect=RuntimeError("session timeout"),
+        ):
+            result = self.run_flow()
+            self.assertIsNone(db.get_account_by_email("fixture@example.com"))
+        self.assertFalse(result["success"])
+        self.assertIsNone(result["account_id"])
+        self.save.assert_not_called()
+        self.assertEqual(self.release.call_args.kwargs["status"], "failed")
 
     def test_failure_before_profile_submission_does_not_save_account(self):
         with isolated_account_storage() as db, patch.object(
@@ -281,6 +338,44 @@ class GptAccountRegistrationTests(unittest.TestCase):
         self.save.assert_not_called()
         insert.assert_not_called()
         self.assertEqual(self.release.call_args.kwargs["status"], "failed")
+
+
+class TokenRecoveryUnitTests(unittest.TestCase):
+    def test_probe_handler_never_reads_body_on_the_event_thread(self):
+        handlers = []
+        driver = SimpleNamespace(context=SimpleNamespace(on=lambda event, fn: handlers.append(fn)))
+        recovery.attach_create_account_probe(driver)
+        response = Mock(url="https://auth.openai.com/api/accounts/create_account", status=200)
+        response.request.method = "POST"
+        response.json.return_value = {"continue_url": "/api/oauth/continue?x=1"}
+        handlers[0](response)
+        response.json.assert_not_called()
+        self.assertEqual(recovery._accepted_continue_url(driver), "/api/oauth/continue?x=1")
+        response.json.assert_called_once()
+
+    def test_resubmit_does_not_navigate_away_from_a_non_profile_page(self):
+        driver = Mock()
+        with patch("core.roxy_registration._page_snapshot", return_value={"url": "https://chatgpt.com/"}), \
+                patch("core.roxy_registration._is_profile_like", return_value=False), \
+                patch("core.roxy_registration._complete_profile_page") as submit:
+            self.assertIsNone(recovery._session_via_profile_resubmit(driver, "Fixture", "1995-01-01"))
+        driver.get.assert_not_called()
+        submit.assert_not_called()
+
+    def test_stop_request_still_records_the_account(self):
+        from core.registration_service import StopRequested
+
+        with patch.object(recovery, "_session_via_create_account_continue", side_effect=StopRequested("stop")), \
+                patch.object(recovery, "_session_via_protocol_login") as relogin, \
+                patch("core.roxy_registration._check_manual_stop"), \
+                patch.object(recovery, "_save_pending_account", return_value=7) as save:
+            result = recovery.recover_session_after_timeout(
+                driver=Mock(), email="a@example.com", name="A", birthday="1995-01-01",
+                password="pw", error=RuntimeError("timeout"), proxy=None,
+            )
+        self.assertEqual(result, {"account_id": 7})
+        save.assert_called_once()
+        relogin.assert_not_called()
 
 
 class GptAccountDriverTests(unittest.TestCase):
