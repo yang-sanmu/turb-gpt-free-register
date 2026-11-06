@@ -5,7 +5,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, nullcontext
 from pathlib import Path
-from threading import Barrier, BrokenBarrierError
+from threading import Barrier, BrokenBarrierError, local
 from unittest.mock import patch
 
 from config import icloud as cfg
@@ -46,6 +46,10 @@ class PickTests(unittest.TestCase):
         patcher = patch("core.db._active_sqlite_path", return_value=db_path)
         patcher.start()
         self.addCleanup(patcher.stop)
+        for name, value in (("_CLAIMS", {}), ("_CLAIM_CONTEXT", local())):
+            p = patch.object(client, name, value)
+            p.start()
+            self.addCleanup(p.stop)
         for name, value in (("_ensure_storage", None), ("_ensure_sqlite", None)):
             p = patch(f"core.db.{name}", return_value=value)
             p.start()
@@ -91,6 +95,111 @@ class PickTests(unittest.TestCase):
             self.assertEqual(client.pick_email(), first)
             with self.assertRaisesRegex(client.ICloudMailError, "均已使用"):
                 client.pick_email()
+
+    def test_stale_cleanup_cannot_release_or_disable_a_new_claim(self):
+        for mode in ("direct", "plus_once"):
+            for first_cleanup in ("driver", "fallback"):
+                with self.subTest(mode=mode, first_cleanup=first_cleanup), patch.multiple(
+                    cfg, ICLOUD_EMAILS=[f"{mode}-{first_cleanup}@icloud.com"], ICLOUD_MODE=mode,
+                ), ThreadPoolExecutor(max_workers=1) as old_worker, ThreadPoolExecutor(max_workers=1) as new_worker:
+                    first = old_worker.submit(client.pick_email).result(timeout=10)
+                    release = client.release_email if first_cleanup == "driver" else client.release_email_if_unconsumed
+                    old_worker.submit(release, first).result(timeout=10)
+                    second = new_worker.submit(client.pick_email).result(timeout=10)
+                    self.assertEqual(second, first)
+
+                    # A 已释放，B 已重新领取；A 的外层兜底和迟到的停用都不能影响 B。
+                    stale_email = f" {first.upper()} "
+                    self.assertFalse(old_worker.submit(
+                        client.release_email_if_unconsumed, stale_email, note="旧任务兜底",
+                    ).result(timeout=10))
+                    for status in ("available", "failed", "disabled"):
+                        old_worker.submit(
+                            client.release_email, stale_email, status=status, note="旧任务状态写入",
+                        ).result(timeout=10)
+                        with closing(client._conn()) as conn:
+                            row = conn.execute(f"SELECT status, note FROM {client._TABLE} WHERE email=?", (second,)).fetchone()
+                        self.assertEqual(tuple(row), ("used", None))
+                        with self.assertRaises(client.ICloudMailError):
+                            client.pick_email()
+
+                    # B 仍能正常回收；线程池复用同一线程时，下次领取也必须可回收。
+                    self.assertTrue(new_worker.submit(client.release_email_if_unconsumed, second).result(timeout=10))
+                    retried = old_worker.submit(client.pick_email).result(timeout=10)
+                    self.assertEqual(retried, first)
+                    self.assertTrue(old_worker.submit(client.release_email_if_unconsumed, retried).result(timeout=10))
+
+    def test_untracked_caller_preserves_existing_recovery_and_disable(self):
+        for mode in ("direct", "plus_once", "plus"):
+            with self.subTest(mode=mode), patch.multiple(
+                cfg, ICLOUD_EMAILS=[f"untracked-{mode}@icloud.com"], ICLOUD_MODE=mode,
+            ):
+                with ThreadPoolExecutor(max_workers=1) as owner:
+                    email = owner.submit(client.pick_email).result(timeout=10)
+                # 原有调用方可在线程结束后回收，不要求必须从领取线程调用。
+                self.assertTrue(client.release_email_if_unconsumed(email))
+                client.release_email(email, status="disabled", note="正常停用")
+                with closing(client._conn()) as conn:
+                    row = conn.execute(f"SELECT status, note FROM {client._TABLE} WHERE email=?", (email,)).fetchone()
+                self.assertEqual(tuple(row), ("disabled", "正常停用"))
+
+    def test_owner_can_disable_after_release_until_someone_reclaims(self):
+        for mode in ("direct", "plus_once"):
+            with self.subTest(mode=mode), patch.multiple(
+                cfg, ICLOUD_EMAILS=[f"disable-{mode}@icloud.com"], ICLOUD_MODE=mode,
+            ):
+                email = client.pick_email()
+                client.release_email(email)
+                client.release_email(email, status="disabled", note="外层判定需停用")
+                self.assertFalse(client.release_email_if_unconsumed(email))
+                with closing(client._conn()) as conn:
+                    row = conn.execute(f"SELECT status, note FROM {client._TABLE} WHERE email=?", (email,)).fetchone()
+                self.assertEqual(tuple(row), ("disabled", "外层判定需停用"))
+                with self.assertRaises(client.ICloudMailError):
+                    client.pick_email()
+
+    def test_new_manual_email_job_does_not_inherit_previous_claim(self):
+        from core import registration_service as service
+
+        def in_job(job_id, action):
+            service._THREAD_CTX.job_id = job_id
+            try:
+                return action()
+            finally:
+                del service._THREAD_CTX.job_id
+
+        def claim_and_release():
+            email = client.pick_email()
+            client.release_email(email)
+            return email
+
+        for mode in ("direct", "plus_once"):
+            with self.subTest(mode=mode), patch.multiple(
+                cfg, ICLOUD_EMAILS=[f"manual-retry-{mode}@icloud.com"], ICLOUD_MODE=mode,
+            ), patch.object(service, "_THREAD_CTX", local()), patch.object(
+                email_provider, "resolve_email_source", return_value="icloud",
+            ), ThreadPoolExecutor(max_workers=1) as old_worker, ThreadPoolExecutor(max_workers=1) as new_worker:
+                email = old_worker.submit(in_job, 101, claim_and_release).result(timeout=10)
+                self.assertEqual(new_worker.submit(in_job, 102, client.pick_email).result(timeout=10), email)
+                # 仍属于旧任务的迟到回收必须被拒绝。
+                self.assertFalse(old_worker.submit(
+                    in_job, 101, lambda: client.release_email_if_unconsumed(email),
+                ).result(timeout=10))
+                self.assertTrue(new_worker.submit(
+                    in_job, 102, lambda: client.release_email_if_unconsumed(email),
+                ).result(timeout=10))
+                # 同一线程的新任务手动指定邮箱，不经过 pick_email，也应能正常停用。
+                self.assertTrue(old_worker.submit(
+                    in_job, 103, lambda: service._disable_job_email(email, "手动邮箱任务失败"),
+                ).result(timeout=10))
+                with closing(client._conn()) as conn:
+                    row = conn.execute(f"SELECT status FROM {client._TABLE} WHERE email=?", (email,)).fetchone()
+                self.assertEqual(row[0], "disabled")
+
+    def test_persisted_claim_without_process_owner_keeps_legacy_recovery(self):
+        client.release_email("persisted@icloud.com", status="used")
+        self.assertTrue(client.release_email_if_unconsumed("persisted@icloud.com"))
+        self.assertFalse(client.release_email_if_unconsumed("persisted@icloud.com"))
 
     def test_plus_once_reuses_suffix_after_reload_and_length_change(self):
         with patch.multiple(cfg, ICLOUD_EMAILS=["one@icloud.com"], ICLOUD_MODE="plus_once", ICLOUD_PLUS_LENGTH=7):

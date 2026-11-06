@@ -14,6 +14,7 @@ import logging
 import random
 import re
 import string
+import sys
 import threading
 import time
 from contextlib import closing
@@ -30,6 +31,9 @@ logger = logging.getLogger(__name__)
 _TABLE = "icloud_email_usage"
 _FIXED_ALIAS_TABLE = "icloud_fixed_aliases"
 _ROUND_ROBIN = itertools.count(random.randrange(1000))
+# 仅保护本进程内的工作线程；领取和状态回写均在 db._LOCK 下核对。
+_CLAIMS: dict[str, object] = {}
+_CLAIM_CONTEXT = threading.local()
 _RECIPIENT_HEADERS = ("To", "Sender", "X-QQ-CSender", "Return-Path", "Authentication-Results", "Received-SPF")
 _RECENT_MESSAGES = 40
 # QQ 会把部分 iCloud 转发的 OpenAI 邮件判为垃圾邮件（IMAP 目录名 Junk）。
@@ -75,6 +79,31 @@ def _plus_base(email: str) -> str | None:
     return f"{base}@{domain}" if base and plus and suffix and domain else None
 
 
+def _thread_claims() -> dict[str, object]:
+    # 复用已有任务 ID，避免线程池的新任务继承旧领取；CLI 不主动加载任务服务。
+    service = sys.modules.get("core.registration_service")
+    job_id = getattr(getattr(service, "_THREAD_CTX", None), "job_id", None)
+    if not hasattr(_CLAIM_CONTEXT, "claims") or getattr(_CLAIM_CONTEXT, "job_id", None) != job_id:
+        _CLAIM_CONTEXT.job_id = job_id
+        _CLAIM_CONTEXT.claims = {}
+    return _CLAIM_CONTEXT.claims
+
+
+def _remember_claim(email: str) -> None:
+    _thread_claims()[email] = _CLAIMS[email] = object()
+
+
+def _can_release_claim(email: str) -> bool:
+    # 回收后保留标识：同一任务仍可追加停用；重新领取会换标识，拒绝旧任务回写。
+    # 没有本线程领取记录的调用方保留原来的回收行为，只拦截明确过期的领取。
+    current = _CLAIMS.get(email)
+    claimed = _thread_claims().get(email)
+    if current is None or claimed is None or claimed is current:
+        return True
+    logger.info("[iCloud] 忽略旧领取的状态回写: %s", email)
+    return False
+
+
 def pick_email() -> str:
     mode = str(cfg.ICLOUD_MODE or "plus").strip().lower()
     if mode not in ("direct", "plus", "plus_once"):
@@ -112,6 +141,7 @@ def pick_email() -> str:
                     addr = _new_plus_email(conn, base, check_account=True)
                     conn.execute(f"INSERT INTO {_FIXED_ALIAS_TABLE}(base, email) VALUES(?,?)", (base, addr))
                 _record(conn, addr, base, "used")
+                _remember_claim(addr)
                 logger.info("[iCloud] 领取邮箱: %s", addr)
                 return addr
             raise ICloudMailError(f"ICLOUD_EMAILS 中 {len(bases)} 个邮箱均已使用，请补充或切换 plus 模式")
@@ -119,6 +149,7 @@ def pick_email() -> str:
         base = bases[next(_ROUND_ROBIN) % len(bases)]
         addr = _new_plus_email(conn, base)
         _record(conn, addr, base, "used")
+        _remember_claim(addr)
         logger.info("[iCloud] 生成子邮箱: %s", addr)
         return addr
 
@@ -146,6 +177,8 @@ def is_known_email(email: str) -> bool:
 def release_email(email: str, status: str = "available", note: str | None = None) -> None:
     email = str(email or "").strip().lower()
     with db._LOCK, closing(_conn()) as conn, conn:
+        if not _can_release_claim(email):
+            return
         row = conn.execute(f"SELECT base FROM {_TABLE} WHERE email=?", (email,)).fetchone()
         _record(conn, email, row[0] if row else email.split("+", 1)[0], status, note)
 
@@ -154,6 +187,8 @@ def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
     """任务兜底只回收未落库且仍为 used 的领取，保留已判废状态及固定后缀。"""
     email = str(email or "").strip().lower()
     with db._LOCK, closing(_conn()) as conn, conn:
+        if not _can_release_claim(email):
+            return False
         if db.get_account_by_email(email) is not None:
             return False
         changed = conn.execute(
