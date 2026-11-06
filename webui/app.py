@@ -856,16 +856,29 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "巡检任务不存在"}), 404
         return jsonify({"ok": True, **result})
 
+    def inspection_request_options(data):
+        allowed = {"workers", "archived", "mode", "scope", "account_ids", "filters", "source_inspection_id"}
+        if set(data) - allowed:
+            raise ValueError("请求含未知任务参数")
+        return data
+
+    @app.post("/api/accounts/inspections/preview")
+    def api_preview_account_inspection():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请求体必须是有效的 JSON 对象"}), 400
+        try:
+            return jsonify({"ok": True, **account_inspection_service.preview_inspection(**inspection_request_options(data))})
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
     @app.post("/api/accounts/inspections")
     def api_start_account_inspection():
         data = request.get_json(silent=True)
         if request.get_data() and not isinstance(data, dict):
             return jsonify({"ok": False, "error": "请求体必须是有效的 JSON 对象"}), 400
         try:
-            run, created = account_inspection_service.start_inspection(
-                workers=(data or {}).get("workers", account_inspection_service.DEFAULT_WORKERS),
-                archived=(data or {}).get("archived", "0"),
-                mode=(data or {}).get("mode", "inspection"))
+            run, created = account_inspection_service.start_inspection(**inspection_request_options(data or {}))
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify({"ok": created, "task": run,

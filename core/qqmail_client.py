@@ -153,7 +153,30 @@ def _msg_to_dict(msg) -> dict:
 # IMAP 连接与搜索
 # ============================================================
 
-def _connect_imap() -> imaplib.IMAP4_SSL:
+def _imap_timeout(deadline: float | None = None) -> float:
+    timeout = max(0.1, float(_email_cfg.IMAP_SOCKET_TIMEOUT))
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("IMAP 取码等待时间已耗尽")
+        timeout = min(timeout, remaining)
+    return timeout
+
+
+def _set_imap_timeout(mail, deadline: float | None = None) -> None:
+    mail.sock.settimeout(_imap_timeout(deadline))
+
+
+def _disconnect_imap(mail) -> None:
+    # 只关闭本地连接，避免异常后继续等待服务器的 LOGOUT 响应。
+    if mail is not None:
+        try:
+            mail.shutdown()
+        except Exception:
+            pass
+
+
+def _connect_imap(*, deadline: float | None = None) -> imaplib.IMAP4_SSL:
     """连接 QQ 邮箱 IMAP 服务器并返回连接对象。"""
     server = _email_cfg.QQ_IMAP_SERVER
     port = _email_cfg.QQ_IMAP_PORT
@@ -165,14 +188,19 @@ def _connect_imap() -> imaplib.IMAP4_SSL:
             "QQ 邮箱 IMAP 未配置，请在 config/email.py 中设置 QQ_EMAIL 和 QQ_IMAP_PASSWORD"
         )
 
+    mail = None
     try:
-        mail = imaplib.IMAP4_SSL(server, port)
+        mail = imaplib.IMAP4_SSL(server, port, timeout=_imap_timeout(deadline))
+        _set_imap_timeout(mail, deadline)
         mail.login(qq_email, password)
+        _set_imap_timeout(mail, deadline)
         mail.select("INBOX")
         return mail
     except imaplib.IMAP4.error as exc:
+        _disconnect_imap(mail)
         raise QQMailClientError(f"QQ 邮箱 IMAP 登录失败: {exc}")
     except Exception as exc:
+        _disconnect_imap(mail)
         raise QQMailClientError(f"QQ 邮箱 IMAP 连接失败: {exc}")
 
 
@@ -290,15 +318,11 @@ def fetch_latest_otp(
         try:
             mail = _connect_imap()
             messages = _search_messages(mail, after_dt=after_dt)
-        except QQMailClientError as exc:
-            logger.warning(f"[QQMail] IMAP 连接失败: {exc}")
+        except (QQMailClientError, imaplib.IMAP4.error, OSError, EOFError) as exc:
+            logger.warning(f"[QQMail] IMAP 取件失败: {exc}")
             messages = []
         finally:
-            if mail:
-                try:
-                    mail.logout()
-                except Exception:
-                    pass
+            _disconnect_imap(mail)
 
         # 按时间降序排列
         messages.sort(key=lambda m: m.get("date") or "", reverse=True)

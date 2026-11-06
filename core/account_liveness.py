@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 from core import db
 from core.session import BrowserSession, close_browser_session
@@ -477,7 +478,12 @@ def _login_via_reauth(
     if dead_code:
         raise AccountUnusableError(f"账号已废弃（{dead_code}）", error_code=dead_code)
     human_delay("navigate")
-    logger.info("[查活] 已跟随 reauth authorize URL，开始等待邮箱 OTP")
+    if urlparse(final_url).path.rstrip("/") != "/email-verification":
+        return _login_from_authorize(session, email, final_url, otp_after_ts, email_source=email_source)
+    # authorize 返回 200 或落到验证码页，不代表邮件已发送。
+    send_email_otp(session)
+    otp_after_ts = time.time()
+    logger.info("[查活] 已请求重认证验证码，开始等待邮箱 OTP")
     continue_url = _validate_reauth_with_retry(
         session,
         email,
@@ -486,11 +492,8 @@ def _login_via_reauth(
     )
     logger.info("[查活] reauth OTP 验证通过，开始交换新 token")
     human_delay("api")
-    return _follow_continue_and_fetch(
-        session,
-        continue_url,
-        referer="https://auth.openai.com/email-verification",
-    )
+    return _finish_login_result(session, email, {"continue_url": continue_url},
+                                otp_after_ts, email_source=email_source)
 
 
 def _login_via_email_otp(
@@ -498,6 +501,7 @@ def _login_via_email_otp(
     email: str,
     otp_after_ts: float,
     email_source: str | None = None,
+    *, steps: int = 0,
 ) -> dict:
     """完成邮箱 OTP 登录，并跟随 OAuth callback 后拉取 ChatGPT session。"""
     validate_result = _validate_with_retry(
@@ -506,16 +510,60 @@ def _login_via_email_otp(
         otp_after_ts,
         email_source=email_source,
     )
-    page = validate_result.get("page") if isinstance(validate_result, dict) else {}
+    return _finish_login_result(session, email, validate_result, otp_after_ts,
+                                email_source=email_source, steps=steps + 1)
+
+
+def _finish_login_result(session, email, result, otp_after_ts, *, email_source=None, steps=0,
+                         referer="https://auth.openai.com/email-verification"):
+    """密码、邮箱 OTP、MFA 的响应共用分流，只有完成验证才交换 session。"""
+    if steps >= 6:
+        raise RuntimeError("登录验证步骤重复，未建立登录态")
+    page = result.get("page") if isinstance(result, dict) else {}
     page = page if isinstance(page, dict) else {}
     page_type = str(page.get("type") or "")
-    continue_url = _extract_continue_url(validate_result)
-    if not continue_url:
-        raise RuntimeError(f"OTP 登录成功但没有 OAuth continue_url: {validate_result}")
+    continue_url = _extract_continue_url(result)
     if "about-you" in str(continue_url) or page_type in {"about_you", "about-you"}:
         raise RuntimeError(f"该邮箱登录后进入资料页，疑似不是完整已注册账号: page_type={page_type}, continue_url={continue_url}")
-    logger.info("[查活] 邮箱 OTP 验证完成，开始跟随 OAuth callback")
-    return _follow_continue_and_fetch(session, continue_url, referer="https://auth.openai.com/email-verification")
+    if "/mfa-challenge" in continue_url or page_type == "mfa_challenge":
+        factor_id = _extract_factor_id(result, continue_url)
+        if not factor_id:
+            raise RuntimeError("登录进入 MFA，但响应缺少 factor_id")
+        if not _account_totp_secret(email):
+            raise RuntimeError("登录需要 MFA，但本地缺少 totp_secret；无法完成本次验证")
+        _mfa_issue_challenge(session, factor_id)
+        code = _account_totp_code(email)
+        if not code:
+            raise RuntimeError("无法生成 TOTP 验证码")
+        logger.info("[查活] 登录进入 MFA，提交 TOTP")
+        verified = _mfa_verify(session, factor_id, code)
+        return _finish_login_result(session, email, verified, otp_after_ts,
+                                    email_source=email_source, steps=steps + 1,
+                                    referer=f"https://auth.openai.com/mfa-challenge/{factor_id}")
+    if "email-verification" in continue_url or page_type in {"email_verification", "email_otp_verification", "email_otp_send"}:
+        return _login_via_email_otp(session, email, otp_after_ts,
+                                    email_source=email_source, steps=steps + 1)
+    parsed = urlparse(continue_url)
+    is_callback = parsed.hostname == "chatgpt.com" and parsed.path.startswith("/api/auth/callback/")
+    is_auth_continuation = parsed.hostname == "auth.openai.com" and parsed.path.rstrip("/") == "/authorize/continue"
+    if not (is_callback or is_auth_continuation):
+        # 不能把密码页、MFA 页、未知页面或缺失的 URL 当作已完成登录。
+        raise RuntimeError(f"登录尚未完成：page_type={page_type or 'unknown'} path={parsed.path or '(empty)'}")
+    return _follow_continue_and_fetch(session, continue_url, referer=referer)
+
+
+def _login_from_authorize(session, email, final_url, otp_after_ts, *, email_source=None):
+    parsed = urlparse(final_url)
+    # follow_authorize 已跟随重定向；回到 ChatGPT 后只读取 session，不能再次消费回调 code。
+    if parsed.hostname == "chatgpt.com":
+        return fetch_session(session)
+    path = parsed.path.rstrip("/")
+    if path == "/log-in/password":
+        return _login_via_password_or_otp(session, email, otp_after_ts, email_source=email_source)
+    if path == "/email-verification":
+        return _login_via_requested_email_otp(session, email, email_source=email_source)
+    return _finish_login_result(session, email, {"continue_url": final_url},
+                                otp_after_ts, email_source=email_source)
 
 
 # 密码这一步被拒、但邮箱 OTP 仍可登录的错误码。
@@ -532,6 +580,47 @@ def _login_via_requested_email_otp(
     return _login_via_email_otp(session, email, time.time(), email_source=email_source)
 
 
+def _login_via_passwordless_otp(
+    session: BrowserSession,
+    email: str,
+    email_source: str | None = None,
+) -> dict:
+    """从密码页切换到一次性验证码；不能用验证码页的 resend 代替。"""
+    from core.openai_auth import build_sentinel_header, request_sentinel_token
+
+    sentinel_resp = request_sentinel_token(session, "authorize_continue")
+    sentinel_header, so_header = build_sentinel_header(session, sentinel_resp, "authorize_continue")
+    headers = session.get_auth_headers(referer="https://auth.openai.com/log-in/password")
+    headers["openai-sentinel-token"] = sentinel_header
+    if so_header:
+        headers["openai-sentinel-so-token"] = so_header
+    otp_after_ts = time.time()
+    resp = session.post(
+        "https://auth.openai.com/api/accounts/passwordless/send-otp",
+        headers=headers,
+        allow_redirects=False,
+    )
+    resp.raise_for_status()
+    try:
+        result = resp.json()
+    except ValueError as exc:
+        raise RuntimeError("密码页切换邮箱验证码失败：未返回有效的验证码步骤") from exc
+    result = result if isinstance(result, dict) else {}
+    page = result.get("page") or {}
+    page = page if isinstance(page, dict) else {}
+    page_type = str(page.get("type") or "")
+    next_path = urlparse(_extract_continue_url(result)).path.rstrip("/")
+    if (resp.status_code != 200 or result.get("error")
+            or page_type not in {"email_verification", "email_otp_verification", "email_otp_send"}
+            or (next_path and next_path != "/email-verification")):
+        raise RuntimeError(
+            "密码页切换邮箱验证码失败，未进入验证码步骤："
+            f"status={resp.status_code} page_type={page_type or 'unknown'} path={next_path or '(empty)'}"
+        )
+    logger.info("[查活] 已从密码页切换到邮箱验证码，开始收信：%s", email)
+    return _login_via_email_otp(session, email, otp_after_ts, email_source=email_source)
+
+
 def _login_via_password_or_otp(
     session: BrowserSession,
     email: str,
@@ -542,7 +631,7 @@ def _login_via_password_or_otp(
     password = _account_registration_password(email)
     if not password:
         logger.info("[查活] 未找到注册密码，继续使用邮箱 OTP：%s", email)
-        return _login_via_requested_email_otp(session, email, email_source=email_source)
+        return _login_via_passwordless_otp(session, email, email_source=email_source)
 
     logger.info("[查活] 账号存在密码，优先走密码登录：%s", email)
     try:
@@ -553,47 +642,9 @@ def _login_via_password_or_otp(
             raise
         logger.info("[查活] 密码登录被拒（%s），改用邮箱 OTP：%s", _exception_status_code(exc), email)
         return _login_via_requested_email_otp(session, email, email_source=email_source)
-    continue_url = _extract_continue_url(password_result)
-    page = password_result.get("page") if isinstance(password_result, dict) else {}
-    page = page if isinstance(page, dict) else {}
-    page_type = str(page.get("type") or "")
-
-    if "/mfa-challenge/" in continue_url or page_type == "mfa_challenge":
-        factor_id = _extract_factor_id(password_result, continue_url)
-        secret = _account_totp_secret(email)
-        if not factor_id:
-            raise RuntimeError(f"密码登录后进入 MFA 但未拿到 factor_id: {password_result}")
-        if not secret:
-            raise RuntimeError(f"密码登录后进入 MFA，但账号没有 totp_secret：{email}")
-        logger.info("[查活] 已进入 MFA challenge，开始提交 TOTP：%s factor_id=%s", email, factor_id)
-        _mfa_issue_challenge(session, factor_id)
-        code = _account_totp_code(email)
-        if not code:
-            raise RuntimeError(f"无法生成 TOTP 验证码：{email}")
-        mfa_result = _mfa_verify(session, factor_id, code)
-        mfa_continue_url = _extract_continue_url(mfa_result) or continue_url
-        if not mfa_continue_url:
-            raise RuntimeError(f"MFA 验证成功但没有 continue_url: {mfa_result}")
-        return _follow_continue_and_fetch(
-            session,
-            mfa_continue_url,
-            referer=f"https://auth.openai.com/mfa-challenge/{factor_id}",
-        )
-
-    if "email-verification" in continue_url or page_type in {"email_verification", "email_otp_send"}:
-        logger.info("[查活] 密码登录后仍进入邮箱 OTP，继续完成邮箱验证：%s", email)
-        return _login_via_email_otp(
-            session,
-            email,
-            otp_after_ts,
-            email_source=email_source,
-        )
-
-    if continue_url:
-        logger.info("[查活] 密码登录直接给出回调地址，继续完成回调：%s", email)
-        return _follow_continue_and_fetch(session, continue_url, referer="https://auth.openai.com/log-in/password")
-
-    raise RuntimeError(f"密码登录成功但没有可用 continue_url: {password_result}")
+    return _finish_login_result(session, email, password_result, otp_after_ts,
+                                email_source=email_source,
+                                referer="https://auth.openai.com/log-in/password")
 
 
 def _login_via_full_web_flow(
@@ -619,9 +670,10 @@ def _login_via_full_web_flow(
                 f"账号已废弃（{dead_code}）",
                 error_code=dead_code,
             )
-        session_info = _login_via_password_or_otp(
+        session_info = _login_from_authorize(
             session,
             email,
+            final_url,
             otp_after_ts,
             email_source=email_source,
         )

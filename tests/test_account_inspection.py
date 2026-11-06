@@ -416,7 +416,14 @@ class AccountInspectionTests(unittest.TestCase):
         with patch.object(service.live_check_service, 'enqueue_account_live_check', return_value=completed(True, False)):
             service._run(run)
         self.assertEqual(run['plan_failed_count'], 1)
-        self.assertEqual(db.list_account_inspection_failures(run['id'])['total'], 0)
+        self.assertEqual(run['live_failed_count'], 0)
+        details = db.list_account_inspection_failures(run['id'])
+        self.assertEqual(details['total'], 1)
+        self.assertEqual(details['items'][0]['status'], 'plan_failed')
+        self.assertEqual(service.preview_inspection(mode='plan', scope='history_failed',
+                                                   source_inspection_id=run['id'])['total_count'], 1)
+        self.assertEqual(service.preview_inspection(mode='live', scope='history_failed',
+                                                   source_inspection_id=run['id'])['total_count'], 0)
 
     def test_idle_history_poll_does_not_wait_for_unrelated_writer(self):
         run, _ = db.create_account_inspection([1])
@@ -1599,7 +1606,10 @@ print('acquired' if lease else 'busy', flush=True)
                 self.assertEqual(run['plan_success_count'], sum(i % 3 != 0 for i in success_ids))
                 self.assertEqual(run['plan_failed_count'], sum(i % 3 == 0 for i in success_ids))
                 self.assertIsNone(db.list_account_inspections()['active'])
-                self.assertEqual(db.list_account_inspection_failures(run['id'])['total'], run['live_failed_count'])
+                details = db.list_account_inspection_failures(run['id'])
+                self.assertEqual(details['total'], run['live_failed_count'] + run['plan_failed_count'])
+                self.assertEqual(sum(row['status'] == 'plan_failed' for row in details['items']), run['plan_failed_count'])
+                self.assertEqual(sum(row['status'] != 'plan_failed' for row in details['items']), run['live_failed_count'])
                 for account_id in ids:
                     self.assertNotIn(account_id, module._RUNNING)
                     self.assertNotIn(account_id, plan_service._RUNNING)

@@ -24,7 +24,10 @@ from config import email as _email_cfg
 from config import icloud as cfg
 from core import db
 from core.otp_utils import extract_otp, looks_like_openai_email
-from core.qqmail_client import _connect_imap, _decode_email_header, _msg_to_dict, _parse_email_date
+from core.qqmail_client import (
+    _connect_imap, _decode_email_header, _disconnect_imap, _msg_to_dict,
+    _parse_email_date, _set_imap_timeout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,11 +215,15 @@ def is_addressed_to(header_text: str, to_text: str, email: str) -> bool:
     return f"{local}@{domain}" in str(to_text or "").lower() and f"{local}+" not in flat
 
 
-def _recent_headers(mail, after_dt: datetime) -> list[tuple[bytes, email_lib.message.Message]]:
+def _recent_headers(
+    mail, after_dt: datetime, deadline: float | None = None,
+) -> list[tuple[bytes, email_lib.message.Message]]:
+    _set_imap_timeout(mail, deadline)
     status, data = mail.search(None, f"(SINCE {after_dt.strftime('%d-%b-%Y')})")
     ids = (data[0].split() if status == "OK" and data and data[0] else [])[-_RECENT_MESSAGES:]
     if not ids:
         return []
+    _set_imap_timeout(mail, deadline)
     status, data = mail.fetch(b",".join(ids), "(BODY.PEEK[HEADER])")
     out = []
     for part in data or []:
@@ -226,15 +233,19 @@ def _recent_headers(mail, after_dt: datetime) -> list[tuple[bytes, email_lib.mes
     return out
 
 
-def _latest_otp_in_folder(mail, email: str, after_ts: float, after_dt: datetime) -> tuple[str, float, str] | None:
+def _latest_otp_in_folder(
+    mail, email: str, after_ts: float, after_dt: datetime,
+    deadline: float | None = None,
+) -> tuple[str, float, str] | None:
     """当前已选目录里发给 email 的最新 OpenAI 验证码：(otp, ts, subject)。"""
-    for mid, head in sorted(_recent_headers(mail, after_dt), key=lambda x: _parse_email_date(x[1]) or 0, reverse=True):
+    for mid, head in sorted(_recent_headers(mail, after_dt, deadline), key=lambda x: _parse_email_date(x[1]) or 0, reverse=True):
         ts = _parse_email_date(head) or 0.0
         if ts and ts < after_ts - 30:
             continue
         header_text = " ".join(_decode_email_header(v) for k in _RECIPIENT_HEADERS for v in (head.get_all(k) or []))
         if not is_addressed_to(header_text, _decode_email_header(head.get("To") or ""), email):
             continue
+        _set_imap_timeout(mail, deadline)
         status, data = mail.fetch(mid, "(BODY.PEEK[])")
         if status != "OK" or not data or not isinstance(data[0], tuple):
             continue
@@ -259,35 +270,37 @@ def fetch_latest_otp(
     interval = max(1, int(poll_interval if poll_interval is not None else _email_cfg.OTP_POLL_INTERVAL))
     settle = int(settle_seconds if settle_seconds is not None else _email_cfg.OTP_SETTLE_SECONDS)
     after_dt = datetime.fromtimestamp(after_ts - 30, tz=timezone.utc)
-    deadline = time.time() + max_wait
+    deadline = time.monotonic() + max_wait
     best_otp, best_ts, settle_until = None, 0.0, None
     logger.info("[iCloud] 经 QQ 邮箱轮询验证码：%s，最长 %ss", email, max_wait)
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         mail = None
         try:
-            mail = _connect_imap()  # 已 select INBOX
+            mail = _connect_imap(deadline=deadline)  # 已 select INBOX
             for folder in _FOLDERS:
-                if folder != "INBOX" and mail.select(folder, readonly=True)[0] != "OK":
-                    continue
-                found = _latest_otp_in_folder(mail, email, after_ts, after_dt)
+                if folder != "INBOX":
+                    _set_imap_timeout(mail, deadline)
+                    if mail.select(folder, readonly=True)[0] != "OK":
+                        continue
+                found = _latest_otp_in_folder(mail, email, after_ts, after_dt, deadline)
                 if found and found[1] > best_ts:
                     otp, ts, subject = found
                     if otp != best_otp:
                         logger.info("[iCloud] 锁定验证码 %s（%s，subject=%r），等待 %ss settle", otp, folder, subject, settle)
-                        best_otp, settle_until = otp, time.time() + settle
+                        best_otp, settle_until = otp, time.monotonic() + settle
                     best_ts = ts
         except Exception as exc:
             logger.warning("[iCloud] QQ 邮箱取件失败：%s: %s", type(exc).__name__, exc)
         finally:
-            if mail is not None:
-                try:
-                    mail.logout()
-                except Exception:
-                    pass
-        if best_otp and time.time() >= (settle_until or 0):
+            _disconnect_imap(mail)
+        now = time.monotonic()
+        if best_otp and now >= (settle_until or 0):
             return best_otp
-        time.sleep(min(interval, max(0.5, (settle_until or deadline) - time.time())))
+        remaining = deadline - now
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining, (settle_until or deadline) - now))
 
     if best_otp:
         return best_otp

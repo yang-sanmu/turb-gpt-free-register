@@ -116,6 +116,13 @@ def _run(run: dict) -> None:
                       (" 原因：" + str(account["live_check_error"]) if account.get("live_check_error") else ""),
             ))
             return
+        if run.get("selection") and (
+            account.get("live_check_status") in {"queued", "running"}
+            or account.get("plan_check_status") in {"queued", "running"}
+            or not db.inspection_retry_still_eligible(account_id, run)
+        ):
+            record(skipped_count=1, processed_count=1)
+            return
         if mode == "plan":
             try:
                 result = _check_plan(account, stage_executor)
@@ -149,7 +156,7 @@ def _run(run: dict) -> None:
         failure = None if live_ok else dict(account_id=account_id, email=account.get("email", ""),
                                             status=live_result.get("status") or "failed",
                                             error=live_result.get("error") or "查活失败，未返回具体原因")
-        if mode == "live" and live_ok and not plan_ok:
+        if live_ok and not plan_ok:
             failure = dict(account_id=account_id, email=account.get("email", ""), status="plan_failed",
                            error=(live_result.get("plan_result") or {}).get("error") or "查活成功，自动查询套餐失败")
         record(failure=failure, **counts)
@@ -241,7 +248,8 @@ def list_inspections(limit: int = 50, offset: int = 0) -> dict:
             lease.close()
 
 
-def start_inspection(workers: int = DEFAULT_WORKERS, archived: str | bool = "0", mode: str = "inspection") -> tuple[dict, bool]:
+def _validate_selection(*, workers=DEFAULT_WORKERS, archived="0", mode="inspection", scope="all",
+                        account_ids=None, filters=None, source_inspection_id=None):
     workers = validate_workers(workers)
     if not isinstance(mode, str) or mode not in ("inspection", "plan", "live"):
         raise ValueError("任务类型必须为 inspection（巡检）、plan（查套餐）或 live（查活刷新 AT）")
@@ -249,6 +257,47 @@ def start_inspection(workers: int = DEFAULT_WORKERS, archived: str | bool = "0",
         archived = "only" if archived else "0"
     if not isinstance(archived, str) or archived not in ("0", "only", "all"):
         raise ValueError("归档范围必须为 0（未归档）、only（已归档）或 all（全部）")
+    if not isinstance(scope, str) or scope not in {"all", "filtered", "selected", "failed", "history_failed"}:
+        raise ValueError("执行范围无效")
+    if scope in {"failed", "history_failed"} and mode == "inspection":
+        raise ValueError("重试失败项请选择查活或查套餐")
+    selection = {"scope": scope}
+    if scope == "selected":
+        if not isinstance(account_ids, list) or not account_ids or len(account_ids) > 10000 or any(
+            type(i) is not int or not 0 < i <= 2**63 - 1 for i in account_ids
+        ):
+            raise ValueError("已勾选账号必须是 1–10000 个有效账号 ID")
+        selection["account_ids"] = list(dict.fromkeys(account_ids))
+    elif account_ids is not None:
+        raise ValueError("只有已勾选范围可以指定 account_ids")
+    if scope == "filtered":
+        allowed = {"q", "plan", "codex_status", "totp_status", "date_from", "date_to"}
+        if not isinstance(filters, dict) or set(filters) - allowed or any(
+            not isinstance(v, str) or len(v) > 500 for v in filters.values()
+        ):
+            raise ValueError("筛选条件无效")
+        selection["filters"] = dict(filters)
+    elif filters is not None:
+        raise ValueError("只有当前筛选范围可以指定 filters")
+    if scope == "history_failed":
+        if type(source_inspection_id) is not int or not 0 < source_inspection_id <= 2**63 - 1:
+            raise ValueError("来源任务 ID 无效")
+        selection["source_inspection_id"] = source_inspection_id
+    elif source_inspection_id is not None:
+        raise ValueError("只有历史失败重试可以指定来源任务")
+    return workers, archived, mode, selection
+
+
+def preview_inspection(**options):
+    _, archived, mode, selection = _validate_selection(**options)
+    return db.preview_account_inspection(archived=archived, mode=mode, selection=selection)
+
+
+def start_inspection(workers: int = DEFAULT_WORKERS, archived: str | bool = "0", mode: str = "inspection", *,
+                     scope="all", account_ids=None, filters=None, source_inspection_id=None) -> tuple[dict, bool]:
+    workers, archived, mode, selection = _validate_selection(
+        workers=workers, archived=archived, mode=mode, scope=scope, account_ids=account_ids,
+        filters=filters, source_inspection_id=source_inspection_id)
     lease = acquire_inspection_lease()
     if lease is None:
         active = db.list_account_inspections()["active"]
@@ -256,7 +305,7 @@ def start_inspection(workers: int = DEFAULT_WORKERS, archived: str | bool = "0",
     submitted = False
     try:
         _recover_orphaned_inspections()
-        run, created = db.create_account_inspection(workers=workers, archived=archived, mode=mode)
+        run, created = db.create_account_inspection(workers=workers, archived=archived, mode=mode, selection=selection)
         if created:
             try:
                 future = _EXECUTOR.submit(_run_with_lease, run.copy(), lease)

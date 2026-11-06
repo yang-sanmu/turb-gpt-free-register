@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -82,7 +83,7 @@ class EmailChangeTests(unittest.TestCase):
         with patch("core.account_liveness._network_preflight_with_retry", return_value=(
                  login_session, "https://auth.example/authorize",
              )) as preflight, \
-             patch("core.openai_auth.follow_authorize", return_value="https://auth.example/login") as follow, \
+             patch("core.openai_auth.follow_authorize", return_value="https://auth.openai.com/log-in/password") as follow, \
              patch("core.account_liveness._login_via_password_or_otp", return_value={
                  "accessToken": "fresh-token",
              }) as login, \
@@ -112,7 +113,7 @@ class EmailChangeTests(unittest.TestCase):
              ]) as preflight, \
              patch("core.openai_auth.follow_authorize", side_effect=[
                  RuntimeError("当前 BrowserSession 已熔断冷却：HTTP 403 from callback/openai"),
-                 "https://auth.example/login",
+                 "https://auth.openai.com/log-in/password",
              ]), \
              patch("core.account_liveness._login_via_password_or_otp", return_value={
                  "accessToken": "direct-token",
@@ -146,7 +147,7 @@ class EmailChangeTests(unittest.TestCase):
         }
         with patch("core.chatgpt_auth.get_csrf_token", return_value="csrf") as csrf, \
              patch("core.chatgpt_auth.signin_openai", return_value="https://auth/authorize") as signin, \
-             patch("core.openai_auth.follow_authorize") as follow, \
+             patch("core.openai_auth.follow_authorize", return_value="https://auth.openai.com/log-in/password") as follow, \
              patch("core.account_liveness._login_via_password_or_otp", return_value=session_info) as login, \
              patch("core.account_liveness._safe_fingerprint_for_account", return_value={"geo_country": "JP"}), \
              patch("core.account_liveness._safe_fingerprint_text_for_account", return_value="geo=JP"), \
@@ -170,6 +171,51 @@ class EmailChangeTests(unittest.TestCase):
         update.assert_called_once_with(67, result, expected_account={"email": "new@example.com", "access_token": ""}, expected_run_id=None)
         self.assertTrue(result["plan_result"]["ok"])
         self.assertIs(plan.call_args.kwargs["session"], session)
+
+    def test_email_change_login_dispatches_the_actual_authorize_page(self):
+        from core import account_liveness as login
+
+        session = MagicMock()
+        session.proxy = ""
+        info = {"accessToken": "fresh-token"}
+        routes = {
+            "https://auth.openai.com/email-verification": "_login_via_requested_email_otp",
+            "https://chatgpt.com/": "fetch_session",
+            "https://auth.openai.com/log-in/password": "_login_via_password_or_otp",
+        }
+        for flow in ("recent_login", "post_change"):
+            for final_url, expected in routes.items():
+                with self.subTest(flow=flow, final_url=final_url), ExitStack() as stack:
+                    handlers = {
+                        name: stack.enter_context(patch.object(login, name, return_value=info))
+                        for name in routes.values()
+                    }
+                    stack.enter_context(patch.object(login, "_network_preflight_with_retry", return_value=(session, "authorize")))
+                    stack.enter_context(patch("core.openai_auth.follow_authorize", return_value=final_url))
+                    stack.enter_context(patch("core.chatgpt_auth.get_csrf_token", return_value="csrf"))
+                    stack.enter_context(patch("core.chatgpt_auth.signin_openai", return_value="authorize"))
+                    stack.enter_context(patch.object(email_change_service, "_append_log"))
+                    stack.enter_context(patch.object(email_change_service.db, "get_account", return_value={"email": "a@example.com"}))
+                    stack.enter_context(patch.object(login, "_safe_fingerprint_for_account", return_value={}))
+                    stack.enter_context(patch.object(login, "_safe_fingerprint_text_for_account", return_value=""))
+                    stack.enter_context(patch("core.live_check_service.complete_authenticated_live_check", side_effect=lambda **kw: kw["result"]))
+                    if flow == "recent_login":
+                        used_session, token = email_change_service._refresh_recent_login(
+                            session, account_id=1, email="a@example.com", email_source="icloud")
+                        self.assertIs(used_session, session)
+                        self.assertEqual(token, "fresh-token")
+                    else:
+                        result = email_change_service._check_live_in_current_session(
+                            session, account_id=1, email="a@example.com", email_source="icloud")
+                        self.assertTrue(result["ok"])
+                        self.assertEqual(result["access_token"], "fresh-token")
+                    handlers[expected].assert_called_once()
+                    self.assertIs(handlers[expected].call_args.args[0], session)
+                    if expected != "fetch_session":
+                        self.assertEqual(handlers[expected].call_args.kwargs["email_source"], "icloud")
+                    for name, handler in handlers.items():
+                        if name != expected:
+                            handler.assert_not_called()
 
     def test_begin_skips_reauth_when_existing_token_is_recent(self):
         session = MagicMock()

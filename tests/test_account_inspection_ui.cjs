@@ -6,8 +6,8 @@ const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const empty = {active:null, total:0, items:[]};
 const active = {active:{id:1}, total:1, items:[{id:1, archived:'only', status:'running', workers:4}]};
 async function flush() {for (let i = 0; i < 12; i++) await Promise.resolve();}
-function harness(storage = new Map()) {
-  const elements = new Map(), requests = [], timers = new Map(), toasts = [];
+function harness(storage = new Map(), deferPreview = false) {
+  const elements = new Map(), requests = [], previews = [], timers = new Map(), toasts = [];
   let nextTimer = 0, accountsReloaded = 0;
   const confirmations = [], selected = new Set([1,2]);
   function element(id) {
@@ -26,17 +26,19 @@ function harness(storage = new Map()) {
     clearTimeout(id){timers.delete(id);}, setInterval(){},
     showToast(message){toasts.push(message);}, loadAccounts(){accountsReloaded++;}, loadSummary(){},
     esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));},
-    api(url,options){return new Promise((resolve,reject)=>{
+    api(url,options){
+      if(url.endsWith("/preview") && !deferPreview)return Promise.resolve({ok:true,total_count:4});
+      return new Promise((resolve,reject)=>{
       const request={url,options,settled:false};
       request.resolve=value=>{request.settled=true;resolve(value);};
       request.reject=error=>{request.settled=true;reject(error);};
-      requests.push(request);
+      (url.endsWith("/preview") ? previews : requests).push(request);
       options?.signal?.addEventListener('abort',()=>request.reject(new Error('aborted')));
     });},
   });
   const run=source=>vm.runInContext(source,context);
   run(script);
-  return {element,requests,timers,toasts,run,confirmations,selected,storage,get accountsReloaded(){return accountsReloaded;},
+  return {element,requests,previews,timers,toasts,run,confirmations,selected,storage,get accountsReloaded(){return accountsReloaded;},
     async resolve(index,value){requests[index].resolve(value);await flush();},
     async reject(index,error){requests[index].reject(error);await flush();},
     async expire(){for(const callback of [...timers.values()])callback();await flush();},
@@ -45,11 +47,11 @@ function harness(storage = new Map()) {
 (async()=>{
   // 范围以打开弹窗时为准；启动前/期间旧 GET 不能解锁，丢弃后立即补读。
   const h=harness();
-  h.run('startAccountInspection()');
+  h.run('startAccountInspection()'); await flush();
   assert.equal(h.element('inspectionScopeLabel').textContent,'已归档');
   h.run('SHOW_ARCHIVED_ACCOUNTS=false');
   const submit=h.run('submitAccountInspection({preventDefault(){}})');
-  assert.deepEqual(JSON.parse(h.requests[1].options.body),{workers:4,archived:'only',mode:'inspection'});
+  assert.deepEqual(JSON.parse(h.requests[1].options.body),{workers:4,archived:'only',mode:'inspection',scope:'all'});
   await h.resolve(0,empty);
   assert.equal(h.element('btnStartInspection').disabled,true);
   h.run('refreshInspectionHistory()');
@@ -85,7 +87,7 @@ function harness(storage = new Map()) {
 
   // POST 超时不能永久卡住，也不能假定服务端未创建任务而允许盲目重提。
   const timeout=harness();await timeout.resolve(0,empty);
-  timeout.run('startAccountInspection()');
+  timeout.run('startAccountInspection()'); await flush();
   const pending=timeout.run('submitAccountInspection({preventDefault(){}})');
   await timeout.expire();await pending;
   assert.equal(timeout.run('inspectionStarting'),false);
@@ -109,7 +111,7 @@ function harness(storage = new Map()) {
 
   // POST 断连后的旧 GET 不得错误解除“状态待确认”。
   const uncertain=harness();await uncertain.resolve(0,empty);
-  uncertain.run('startAccountInspection()');
+  uncertain.run('startAccountInspection()'); await flush();
   const failure=uncertain.run('submitAccountInspection({preventDefault(){}})');
   uncertain.run('refreshInspectionHistory()');
   await uncertain.reject(1,new Error('connection lost'));await failure;
@@ -212,10 +214,10 @@ function harness(storage = new Map()) {
   // 两种一键模式无需勾选；仅提交模式、范围与线程，运行中点击入口只恢复进度。
   for (const mode of ['plan','live']) {
     const bulk=harness();await bulk.resolve(0,empty);bulk.selected.clear();
-    bulk.run(`startAccountInspection('${mode}')`);
+    bulk.run(`startAccountInspection('${mode}')`); await flush();
     assert.match(bulk.element('inspectionStartTitle').textContent,mode==='plan'?/查套餐/:/查活刷新 AT/);
     const starting=bulk.run('submitAccountInspection({preventDefault(){}})');
-    assert.deepEqual(JSON.parse(bulk.requests[1].options.body),{workers:4,archived:'only',mode});
+    assert.deepEqual(JSON.parse(bulk.requests[1].options.body),{workers:4,archived:'only',mode,scope:'all'});
     await bulk.resolve(1,{ok:true,task:{id:42,mode}});await starting;
     const ongoing={active:{id:42,mode},total:1,items:[{id:42,mode,status:'running',total_count:10,
       processed_count:3,checked_count:8,skipped_count:1,plan_failed_count:1,failure_count:1}]};
@@ -225,7 +227,7 @@ function harness(storage = new Map()) {
     bulk.element('inspectionHistoryDialog').close();
     bulk.run('refreshInspectionHistory()');await bulk.resolve(3,ongoing);
     assert.equal(bulk.element('inspectionHistoryDialog').open,false); // 后台轮询不反复弹出。
-    bulk.run(`startAccountInspection('${mode}')`);
+    bulk.run(`startAccountInspection('${mode}')`); await flush();
     assert.equal(bulk.element('inspectionHistoryDialog').open,true);
     assert.equal(bulk.requests.filter(r=>r.options?.method==='POST').length,1);
     await bulk.resolve(4,ongoing);
@@ -271,7 +273,7 @@ function harness(storage = new Map()) {
 
   // 曾翻到旧历史页后启动失败，恢复进度必须读取第一页，才能显示当前任务。
   const recovery=harness();await recovery.resolve(0,empty);
-  recovery.run("inspectionPage=2;startAccountInspection('plan')");
+  recovery.run("inspectionPage=2;startAccountInspection('plan')"); await flush();
   const recovering=recovery.run('submitAccountInspection({preventDefault(){}})');
   await recovery.reject(1,new Error('connection lost'));await recovering;
   assert.equal(recovery.requests[2].url,'/api/accounts/inspections?page=1');
@@ -279,5 +281,60 @@ function harness(storage = new Map()) {
   assert.equal(recovery.element('inspectionHistoryDialog').open,true);
   assert.equal(recovery.element('inspectionStartDialog').open,false);
   assert.match(recovery.element('inspectionHistoryContent').innerHTML,/#1/);
-  console.log('巡检 UI 验收通过：范围、旧响应隔离、GET/POST 超时、未知启动结果防重、分页补读、统计与转义。');
+  // 范围预览的旧响应不可启用新范围；零账号和失败均不能提交。
+  const selection=harness(new Map(),true);await selection.resolve(0,empty);
+  selection.run("startAccountInspection('live')");
+  assert.equal(selection.element('btnConfirmInspection').disabled,true);
+  selection.element('inspectionSelectionScope').value='failed';
+  selection.run('changeInspectionSelection()');
+  selection.previews[0].resolve({ok:true,total_count:99});await flush();
+  assert.equal(selection.element('btnConfirmInspection').disabled,true);
+  selection.previews[1].resolve({ok:true,total_count:0});await flush();
+  assert.equal(selection.element('btnConfirmInspection').disabled,true);
+  await selection.run('submitAccountInspection({preventDefault(){}})');
+  assert.equal(selection.requests.length,1);
+  selection.run('previewInspectionSelection()');
+  selection.previews[2].reject(new Error('preview failed'));await flush();
+  assert.equal(selection.element('btnConfirmInspection').disabled,true);
+  selection.run('previewInspectionSelection()');
+  selection.previews[3].resolve({ok:true,total_count:2});await flush();
+  assert.equal(selection.element('btnConfirmInspection').disabled,false);
+  const startSelected=selection.run('submitAccountInspection({preventDefault(){}})');
+  assert.deepEqual(JSON.parse(selection.requests[1].options.body),{workers:4,archived:'only',mode:'live',scope:'failed'});
+  await selection.resolve(1,{ok:true});await startSelected;
+
+  // 当前筛选和勾选以打开弹窗时为准，筛选不是当前页 ID 列表。
+  const filters=harness();await filters.resolve(0,empty);
+  filters.run("getAccountsQuery=()=> 'needle'; getAccountsPlanFilter=()=> 'plus'; getAccountsTotpFilter=()=> 'enabled'");
+  filters.element('dateFromAccountsV2').value='2026-11-01';
+  filters.element('dateToAccountsV2').value='2026-11-03';
+  filters.run("startAccountInspection('plan')");await flush();
+  filters.run("getAccountsQuery=()=> 'changed'; ACCOUNT_SELECTED.clear()");
+  filters.element('inspectionSelectionScope').value='filtered';
+  filters.run('changeInspectionSelection()');await flush();
+  assert.deepEqual(JSON.parse(filters.run('JSON.stringify(inspectionSelectionOptions())')),{
+    archived:'only',mode:'plan',scope:'filtered',filters:{q:'needle',plan:'plus',codex_status:'',totp_status:'enabled',date_from:'2026-11-01',date_to:'2026-11-03'},
+  });
+  filters.element('inspectionSelectionScope').value='selected';
+  filters.run('changeInspectionSelection()');await flush();
+  assert.deepEqual(JSON.parse(filters.run('JSON.stringify(inspectionSelectionOptions())')).account_ids,[1,2]);
+
+  // 历史的两个阶段独立重试；按钮只接受已结束、有明细的任务。
+  const retry=harness();await retry.resolve(0,empty);
+  retry.run('refreshInspectionHistory()');
+  await retry.resolve(1,{active:null,total:1,items:[{id:77,mode:'live',archived:'0',status:'completed',
+    failure_details_available:true,live_failed_count:1,plan_failed_count:1,selection:{scope:'failed'}}]});
+  const retryHtml=retry.element('inspectionHistoryContent').innerHTML;
+  assert.match(retryHtml,/retryInspectionFailures\(77, 'live', '0'\)/);
+  assert.match(retryHtml,/retryInspectionFailures\(77, 'plan', '0'\)/);
+  retry.run("retryInspectionFailures(77,'plan','0')");await flush();
+  assert.equal(retry.element('inspectionScopeLabel').textContent,'未归档');
+  assert.equal(retry.element('inspectionSelectionScope').value,'history_failed');
+  assert.match(retry.element('inspectionSelectionHint').textContent,/#77/);
+  const retrySubmit=retry.run('submitAccountInspection({preventDefault(){}})');
+  assert.deepEqual(JSON.parse(retry.requests[2].options.body),{workers:4,archived:'0',mode:'plan',scope:'history_failed',source_inspection_id:77});
+  await retry.resolve(2,{ok:true});await retrySubmit;
+  assert.equal(retry.run("inspectionRetryButton({id:1,status:'running',failure_details_available:true,plan_failed_count:1},'plan')"),'');
+  assert.equal(retry.run("inspectionRetryButton({id:1,status:'completed',plan_failed_count:1},'plan')"),'');
+  console.log('巡检 UI 验收通过：筛选/勾选/最近失败/历史分阶段重试、预览竞态与空范围防重、旧响应隔离、超时、分页、统计与转义。');
 })().catch(error=>{console.error(error);process.exitCode=1;});

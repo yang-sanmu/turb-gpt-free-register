@@ -401,6 +401,7 @@ class OtpWaitTests(unittest.TestCase):
     def _waited(self, *, otp_max_wait, icloud_wait, max_wait=None):
         clock = {"now": 1000.0}
         with patch.object(client.time, "time", side_effect=lambda: clock["now"]), \
+                patch.object(client.time, "monotonic", side_effect=lambda: clock["now"]), \
                 patch.object(client.time, "sleep", side_effect=lambda s: clock.update(now=clock["now"] + s)), \
                 patch.object(client, "_connect_imap", side_effect=OSError("offline")), \
                 patch("config.email.OTP_MAX_WAIT", otp_max_wait), \

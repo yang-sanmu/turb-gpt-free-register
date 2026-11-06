@@ -76,6 +76,8 @@ class PasswordOrOtpLoginTests(unittest.TestCase):
         self.calls = []
         patches = [
             patch.object(liveness, "send_email_otp", side_effect=lambda s: self.calls.append("send")),
+            patch.object(liveness, "_login_via_passwordless_otp",
+                         side_effect=lambda *a, **k: self.calls.append("passwordless") or {"accessToken": "t"}),
             patch.object(liveness, "_login_via_email_otp",
                          side_effect=lambda *a, **k: self.calls.append("otp") or {"accessToken": "t"}),
             patch.object(liveness, "_follow_continue_and_fetch", return_value={"accessToken": "cb"}),
@@ -88,7 +90,7 @@ class PasswordOrOtpLoginTests(unittest.TestCase):
         with patch.object(liveness, "_account_registration_password", return_value=""):
             info = liveness._login_via_password_or_otp(self.session, "a@example.com", 1.0)
         self.assertEqual(info["accessToken"], "t")
-        self.assertEqual(self.calls, ["send", "otp"])
+        self.assertEqual(self.calls, ["passwordless"])
 
     def test_rejected_password_step_falls_back_to_requested_code(self):
         for code, status in (("invalid_auth_step", 400), ("password_reset_required", 401)):
@@ -362,7 +364,7 @@ class AccountLivenessTests(unittest.TestCase):
                      patch.object(liveness, 'follow_authorize', side_effect=error if stage == 'authorize' else None,
                                   return_value='https://auth.example/email-verification'), \
                      patch.object(liveness, 'detect_account_unusable_text', return_value='account_deactivated' if stage == 'deactivated' else None), \
-                     patch.object(liveness, '_login_via_password_or_otp', side_effect=error if stage == 'otp' else None), \
+                     patch.object(liveness, '_login_from_authorize', side_effect=error if stage == 'otp' else None), \
                      patch.object(liveness, 'close_browser_session', wraps=liveness.close_browser_session) as close:
                     expected = liveness.AccountUnusableError if stage == 'deactivated' else RuntimeError
                     with self.assertRaises(expected):
@@ -377,7 +379,7 @@ class AccountLivenessTests(unittest.TestCase):
         with patch.object(liveness, '_network_preflight_with_retry', return_value=(session, 'https://auth.example/authorize')), \
              patch.object(liveness, 'follow_authorize', return_value='https://auth.example/email-verification'), \
              patch.object(liveness, 'detect_account_unusable_text', return_value=None), \
-             patch.object(liveness, '_login_via_password_or_otp', return_value=info), \
+             patch.object(liveness, '_login_from_authorize', return_value=info), \
              patch.object(liveness, 'close_browser_session') as close:
             returned, result = liveness._login_via_full_web_flow('user@example.com', '',
                 email_source=None, fingerprint_state={})
@@ -446,6 +448,7 @@ class AccountLivenessTests(unittest.TestCase):
              patch.object(live_service, "resolve_plan_check_route", side_effect=route_for), \
              patch("config.proxy.PLAN_CHECK_PROXY", [proxy_a, proxy_b]), \
              patch("config.proxy.PLAN_CHECK_MAX_ATTEMPTS", 3), \
+             patch("config.proxy.PLAN_CHECK_UPSTREAM_PROXY", ""), \
              patch.object(live_service.random, "choice", return_value=proxy_b), \
              patch.object(live_service, "check_account_liveness", side_effect=[failed, success]) as check:
             result = live_service._run_live_check(
@@ -487,6 +490,7 @@ class AccountLivenessTests(unittest.TestCase):
              patch.object(live_service, "resolve_plan_check_route", return_value=route), \
              patch("config.proxy.PLAN_CHECK_PROXY", [proxy_url]), \
              patch("config.proxy.PLAN_CHECK_MAX_ATTEMPTS", 3), \
+             patch("config.proxy.PLAN_CHECK_UPSTREAM_PROXY", ""), \
              patch.object(live_service, "check_account_liveness", return_value=failed) as check:
             result = live_service._run_live_check(
                 account_id=1, email="user@example.com", proxy=None, trigger="manual",

@@ -2109,6 +2109,7 @@ def update_account_liveness(acc_id: int, result: dict | None = None, *, expected
         row["live_check_status"] = status
         row["live_check_ok"] = ok
         row["live_checked_at"] = result.get("checked_at") or now
+        row["live_check_completed_at"] = now
         row["live_check_error"] = None if ok else result.get("error")
         row["updated_at"] = now
 
@@ -2261,6 +2262,7 @@ def claim_account_live_check(acc_id: int, trigger: str = "manual", *, run_id: st
         row["live_check_queued_at"] = now
         row["live_check_started_at"] = None
         row["live_checked_at"] = None
+        row["live_check_completed_at"] = None
         row["live_check_error"] = None
         row["updated_at"] = now
         return True
@@ -3859,7 +3861,79 @@ def _inspection_payload(run):
     return json.dumps({k: v for k, v in run.items() if k != "account_ids"}, ensure_ascii=False)
 
 
-def create_account_inspection(account_ids: list[int] | None = None, workers: int = 3, archived: str = "0", mode: str = "inspection") -> tuple[dict, bool]:
+def _inspection_selection_ids(conn, *, archived, mode, selection, only_account_id=None):
+    """预览和启动使用同一选择规则；启动时在占用任务的事务内固定 ID。"""
+    scope = selection["scope"]
+    status = lambda key: f"lower(trim(COALESCE(json_extract(payload, '$.{key}'), '')))"
+    live, plan = status("live_check_status"), status("plan_check_status")
+    where = [f"{live} NOT IN ('deactivated','queued','running')", f"{plan} NOT IN ('queued','running')"]
+    params = []
+    if archived != "all":
+        where.append("archived=?")
+        params.append(int(archived == "only"))
+    if only_account_id is not None:
+        where.append("id=?")
+        params.append(only_account_id)
+    if scope == "selected":
+        where.append("id IN (SELECT value FROM json_each(?))")
+        params.append(json.dumps(selection["account_ids"]))
+    if scope == "filtered":
+        filters = selection["filters"]
+        clauses, values = _account_filter_sql(filters.get("plan"), filters.get("codex_status"), filters.get("totp_status"))
+        where.extend(clauses)
+        params.extend(values)
+        if filters.get("q", "").strip():
+            where.append("lower(payload) LIKE ?")
+            params.append("%" + filters["q"].strip().lower() + "%")
+        for key, op, suffix in (("date_from", ">=", "T00:00:00"), ("date_to", "<=", "T23:59:59.999999")):
+            value = filters.get(key)
+            if value:
+                where.append(f"created_at {op} ?")
+                params.append(value + (suffix if len(value) == 10 else ""))
+    if scope == "failed":
+        where.append(f"{plan if mode == 'plan' else live} = 'failed'")
+    if scope == "history_failed":
+        source_id = selection["source_inspection_id"]
+        source = conn.execute("SELECT payload FROM account_inspections WHERE id=?", (source_id,)).fetchone()
+        if source is None:
+            raise ValueError("来源任务不存在")
+        source = json.loads(source[0])
+        if not source.get("failure_details_available"):
+            raise ValueError("该历史任务未保存失败明细，无法重试")
+        if source.get("status") in {"queued", "running"}:
+            raise ValueError("来源任务尚未结束，请等待完成后重试")
+        stage_status = "f.status = 'plan_failed'" if mode == "plan" else "f.status IN ('failed','error','rejected')"
+        success_status = plan if mode == "plan" else live
+        success_value = "success" if mode == "plan" else "live"
+        checked_key = "plan_checked_at" if mode == "plan" else "live_checked_at"
+        completed_key = "plan_check_completed_at" if mode == "plan" else "live_check_completed_at"
+        # 失败后账号已换邮箱、被删除或该阶段后来成功，则不重放旧任务。
+        where.append(f"""EXISTS (SELECT 1 FROM account_inspection_failures f
+            WHERE f.inspection_id=? AND f.account_id=accounts.id
+              AND lower(f.email)=lower(accounts.email) AND {stage_status}
+              AND NOT ({success_status}=? AND
+                COALESCE(json_extract(payload, '$.{completed_key}'),
+                         json_extract(payload, '$.{checked_key}'), '') >= f.failed_at))""")
+        params.extend([source_id, success_value])
+    return [row[0] for row in conn.execute("SELECT id FROM accounts WHERE " + " AND ".join(where) + " ORDER BY id DESC", params)]
+
+
+def preview_account_inspection(*, archived, mode, selection):
+    with closing(_inspection_conn()) as conn:
+        conn.execute("BEGIN")
+        return {"total_count": len(_inspection_selection_ids(conn, archived=archived, mode=mode, selection=selection))}
+
+
+def inspection_retry_still_eligible(account_id, run):
+    selection = run.get("selection") or {}
+    if selection.get("scope") not in {"failed", "history_failed"}:
+        return True
+    with closing(_inspection_conn()) as conn:
+        return bool(_inspection_selection_ids(conn, archived="all", mode=run["mode"],
+                                              selection=selection, only_account_id=account_id))
+
+
+def create_account_inspection(account_ids: list[int] | None = None, workers: int = 3, archived: str = "0", mode: str = "inspection", *, selection: dict | None = None) -> tuple[dict, bool]:
     if account_ids is not None:
         account_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids))
     with closing(_inspection_conn()) as conn, conn:
@@ -3871,7 +3945,11 @@ def create_account_inspection(account_ids: list[int] | None = None, workers: int
                                     (existing["id"],)).fetchone()
             existing["account_ids"] = json.loads(snapshot[0]) if snapshot else []
             return existing, False
-        if account_ids is None:
+        if selection is not None:
+            account_ids = _inspection_selection_ids(conn, archived=archived, mode=mode, selection=selection)
+            if not account_ids:
+                raise ValueError("当前范围没有可执行的账号（已排除忙碌、已废及后来已成功的账号）")
+        elif account_ids is None:
             # 与任务占用处于同一事务中，避免 OFFSET 分页遇到新增/归档/删除时漏账号。
             sql = "SELECT id FROM accounts"
             params = ()
@@ -3885,6 +3963,9 @@ def create_account_inspection(account_ids: list[int] | None = None, workers: int
                    live_success_count=0, live_failed_count=0,
                    plan_success_count=0, plan_failed_count=0, error="",
                    failure_details_available=True, account_ids=account_ids)
+        if selection is not None:
+            # ID 清单仅放在不可变快照表，避免每次更新进度重复写入。
+            run["selection"] = {k: v for k, v in selection.items() if k != "account_ids"}
         cursor = conn.execute("INSERT INTO account_inspections(status,payload) VALUES (?,?)", (run["status"], _inspection_payload(run)))
         run["id"] = cursor.lastrowid
         conn.execute("UPDATE account_inspections SET payload=? WHERE id=?", (_inspection_payload(run), run["id"]))

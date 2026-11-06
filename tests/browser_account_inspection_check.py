@@ -127,6 +127,11 @@ with sync_playwright() as p:
             page.evaluate("""async mode => {
               fixtureItems=[];
               api=async(url,options)=>{
+                if(url.endsWith('/preview')) {
+                  const request=JSON.parse(options.body);
+                  window.lastInspectionPreview=request;
+                  return {ok:true,total_count:request.scope==='selected' ? 0 : request.scope==='failed' ? 3 : 20};
+                }
                 if(options?.method==='POST') {
                   const request=JSON.parse(options.body);
                   if(request.mode!==mode || request.archived!=='only')throw Error('wrong scope/mode');
@@ -142,6 +147,20 @@ with sync_playwright() as p:
             }""", mode)
             page.set_viewport_size({'width':390,'height':844})
             assert page.locator('#inspectionStartTitle').inner_text()=='启动'+title
+            page.wait_for_function('inspectionPreviewReady')
+            page.locator('#inspectionSelectionScope').select_option('failed')
+            page.wait_for_function('inspectionPreviewReady && inspectionPreviewCount===3')
+            assert page.evaluate('lastInspectionPreview.scope')=='failed'
+            assert not page.locator('#btnConfirmInspection').is_disabled()
+            page.screenshot(path=str(output/f'one-click-{mode}-failed-scope-{template}.png'))
+            page.locator('#inspectionSelectionScope').select_option('filtered')
+            page.wait_for_function('inspectionPreviewReady && lastInspectionPreview.scope==="filtered"')
+            assert page.evaluate('typeof lastInspectionPreview.filters')=='object'
+            page.locator('#inspectionSelectionScope').select_option('selected')
+            page.wait_for_function('inspectionPreviewReady && inspectionPreviewCount===0')
+            assert page.locator('#btnConfirmInspection').is_disabled()
+            page.locator('#inspectionSelectionScope').select_option('all')
+            page.wait_for_function('inspectionPreviewReady && inspectionPreviewCount===20')
             page.screenshot(path=str(output/f'one-click-{mode}-start-{template}.png'))
             page.locator('#btnConfirmInspection').click()
             page.wait_for_function("!inspectionLoading && document.getElementById('inspectionHistoryContent').textContent.includes('6 / 20')")
@@ -158,6 +177,32 @@ with sync_playwright() as p:
             page.set_viewport_size({'width':1328,'height':800})
             page.screenshot(path=str(output/f'one-click-{mode}-progress-{template}.png'))
             page.keyboard.press('Escape')
+        # 历史入口必须保留来源任务与阶段，套餐失败重试不触发查活。
+        page.evaluate("""async () => {
+          fixtureItems=[{id:77,mode:'live',archived:'0',status:'completed',failure_details_available:true,
+            live_failed_count:1,plan_failed_count:1}];
+          api=async(url,options)=>{
+            if(url.endsWith('/preview'))return {ok:true,total_count:1};
+            if(options?.method==='POST') {
+              const body=JSON.parse(options.body);
+              if(body.mode!=='plan' || body.scope!=='history_failed' || body.source_inspection_id!==77 || body.archived!=='0')throw Error('wrong historical retry');
+              fixtureItems=[{id:78,mode:'plan',archived:'0',status:'running',total_count:1}];
+              return {ok:true,task:fixtureItems[0]};
+            }
+            return {active:fixtureItems.find(x=>x.status==='running')||null,total:fixtureItems.length,items:fixtureItems};
+          };
+          await refreshInspectionHistory(); openInspectionHistory();
+        }""")
+        page.get_by_role('button',name='重试套餐失败项',exact=True).click()
+        page.wait_for_function('inspectionPreviewReady')
+        assert page.locator('#inspectionSelectionScope').input_value()=='history_failed'
+        assert '#77' in page.locator('#inspectionSelectionHint').inner_text()
+        page.set_viewport_size({'width':390,'height':844})
+        page.screenshot(path=str(output/f'historical-plan-retry-{template}.png'))
+        page.locator('#btnConfirmInspection').click()
+        page.wait_for_function('!inspectionStarting && !inspectionLoading && inspectionActive')
+        assert '查套餐' in page.locator('#inspectionHistoryContent').inner_text()
+        page.keyboard.press('Escape')
         # 接口字段作为文本，未知状态和错误信息不能注入 HTML。
         page.evaluate('fixtureItems=[{id:1,status:"<img src=x onerror=alert(1)>",error:"<script>alert(1)</scr"+"ipt>",total_count:0}]; refreshInspectionHistory()')
         assert page.locator('#inspectionHistoryContent img, #inspectionHistoryContent script').count()==0

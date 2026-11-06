@@ -186,7 +186,7 @@ def _refresh_recent_login(
     """
     # 延迟导入，避免 account_liveness 初始化时形成模块循环。
     from core.account_liveness import (
-        _login_via_password_or_otp,
+        _login_from_authorize,
         _network_preflight_with_retry,
     )
     from core.openai_auth import (
@@ -243,9 +243,10 @@ def _refresh_recent_login(
                     f"账号已废弃（{dead_code}）",
                     error_code=dead_code,
                 )
-            info = _login_via_password_or_otp(
+            info = _login_from_authorize(
                 login_session,
                 email,
+                final_url,
                 otp_after_ts,
                 email_source=email_source or None,
             )
@@ -335,7 +336,7 @@ def _check_live_in_current_session(
 ) -> dict:
     """换绑后复用当前已通过 CF/reauth 的会话重新登录并刷新 AT。"""
     from core.account_liveness import (
-        _login_via_password_or_otp,
+        _login_from_authorize,
         _safe_fingerprint_for_account,
         _safe_fingerprint_text_for_account,
     )
@@ -356,12 +357,13 @@ def _check_live_in_current_session(
     _append_log(account_id, f"原会话查活：signin 成功并取得 authorize URL，cost={_cost(step_started)}")
     otp_after_ts = time.time()
     step_started = time.monotonic()
-    follow_authorize(session, authorize_url)
+    final_url = follow_authorize(session, authorize_url)
     _append_log(account_id, f"原会话查活：authorize 跟随完成，进入密码/OTP/MFA 阶段，cost={_cost(step_started)}")
     step_started = time.monotonic()
-    session_info = _login_via_password_or_otp(
+    session_info = _login_from_authorize(
         session,
         email,
+        final_url,
         otp_after_ts,
         email_source=email_source or None,
     )

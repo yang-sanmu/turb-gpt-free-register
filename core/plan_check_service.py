@@ -225,8 +225,8 @@ def enqueue_account_plan_check(
     account_id = int(account_id)
     email = str(email or "").strip()
     access_token = str(access_token or "").strip()
-    if not access_token:
-        return {"accepted": False, "busy": False, "error": "账号缺少 access_token"}
+    # 空 AT 也由 worker 保存失败结果；底层查询会直接返回，不访问网络。
+    # 在这里直接拒绝会只留下批量失败明细，导致“最近一次失败”漏选。
     run_id = uuid.uuid4().hex
     rejected = _claim_plan_slot(account_id, trigger, run_id=run_id)
     if rejected is not None:
